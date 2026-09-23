@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "medical-rag"
+version = "0.1.0"
+description = "Medical RAG research pipeline experiment."
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic-ai==2.48.0",
+    "openai==3.19.0",
+    "httpx==0.28.1",
+    "faiss-cpu==1.15.1",
+    "sentence-transformers==6.1.0",
+    "datasets==5.0.1",
+    "pandas==3.0.6",
+    "loguru==0.7.3",
+    "statsmodels==0.15.0",
+    "matplotlib==3.11.2",
+    "pyyaml==6.0.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
