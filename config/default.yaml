@@ -1,4 +1,6 @@
 benchmark: medqa_usmle
+dev_split: train
+test_split: test
 output_dir: outputs
 
 retrieval:
@@ -9,3 +11,9 @@ retrieval:
   top_k_retrieve: 20
   top_k_rerank: 5
   reranker_model: cross-encoder/ms-marco-MiniLM-L-6-v2
+
+verifier:
+  min_chunks: 2
+
+reformulator:
+  max_retries: 2

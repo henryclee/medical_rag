@@ -10,7 +10,7 @@ no network access.
 from pathlib import Path
 
 from medical_rag.data.load_medqa import MedQAQuestion, load_medqa
-from medical_rag.data.load_statpearls import StatPearlsChunk, _extract_article_snippets
+from medical_rag.data.load_statpearls import StatPearlsChunk, _concat, _extract_article_snippets
 
 FIXTURE_NXML = """\
 <book-part>
@@ -51,5 +51,11 @@ def test_extract_article_snippets(tmp_path: Path):
     assert snippet["title"] == "Test Article -- Introduction"
     assert "test paragraph" in snippet["content"]
 
-    chunk = StatPearlsChunk(chunk_id=snippet["id"], title=snippet["title"], content=snippet["content"])
+    chunk = StatPearlsChunk(
+        chunk_id=snippet["id"],
+        title=snippet["title"],
+        content=snippet["content"],
+        contents=_concat(snippet["title"], snippet["content"]),
+    )
     assert chunk.source == "statpearls"
+    assert chunk.contents == "Test Article -- Introduction. This is a short test paragraph used to validate the StatPearls chunker."

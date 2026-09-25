@@ -8,8 +8,16 @@ from medical_rag.config import load_config
 def test_load_config_succeeds():
     config = load_config("config/default.yaml")
     assert config.benchmark == "medqa_usmle"
+    assert config.dev_split == "train"
+    assert config.test_split == "test"
+    assert config.verifier.min_chunks == 2
+    assert config.reformulator.max_retries == 2
     assert len(config.conditions) == 10
     assert set(config.models) == {"model_a", "model_b"}
+
+    by_id = {c.id: c for c in config.conditions}
+    assert by_id["1"].params == {}
+    assert by_id["3"].params == {"reranking": True}
 
 
 def test_load_config_rejects_undefined_model(tmp_path):
@@ -37,6 +45,8 @@ def test_load_config_rejects_undefined_model(tmp_path):
     )
     (tmp_path / "default.yaml").write_text(
         "benchmark: x\n"
+        "dev_split: train\n"
+        "test_split: test\n"
         "output_dir: outputs\n"
         "retrieval:\n"
         "  corpus: statpearls\n"
@@ -46,6 +56,10 @@ def test_load_config_rejects_undefined_model(tmp_path):
         "  top_k_retrieve: 1\n"
         "  top_k_rerank: 1\n"
         "  reranker_model: m\n"
+        "verifier:\n"
+        "  min_chunks: 2\n"
+        "reformulator:\n"
+        "  max_retries: 2\n"
     )
 
     with pytest.raises(ValueError, match="undefined model"):

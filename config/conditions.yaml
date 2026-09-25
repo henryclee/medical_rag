@@ -1,7 +1,9 @@
-# 2x2x2 factorial (model x reformulation x verification) + closed-book
-# baselines per model. IDs are ordered to match the delta formulas in
-# experiment/metrics.py: raw_rag = 3/4 - 1/2, reformulation = 5/6 - 3/4,
-# verifier = 7/8 - 3/4, combined = 9/10 - 3/4.
+# Provisional condition set for the current study -- subject to the Phase 10
+# design freeze. As of now: 2x2x2 factorial (model x reformulation x
+# verification) + closed-book baselines per model, all retrieval-on
+# conditions also reranking (via params). IDs are ordered to match the delta
+# formulas in experiment/metrics.py: raw_rag = 3/4 - 1/2, reformulation =
+# 5/6 - 3/4, verifier = 7/8 - 3/4, combined = 9/10 - 3/4.
 conditions:
   - id: "1"
     name: closed_book_model_a
@@ -24,6 +26,7 @@ conditions:
     reformulation: false
     verification: false
     seeds: [0, 1, 2]
+    params: {reranking: true}
   - id: "4"
     name: raw_rag_model_b
     model: model_b
@@ -31,6 +34,7 @@ conditions:
     reformulation: false
     verification: false
     seeds: [0, 1, 2]
+    params: {reranking: true}
   - id: "5"
     name: reformulated_rag_model_a
     model: model_a
@@ -38,6 +42,7 @@ conditions:
     reformulation: true
     verification: false
     seeds: [0, 1, 2]
+    params: {reranking: true}
   - id: "6"
     name: reformulated_rag_model_b
     model: model_b
@@ -45,6 +50,7 @@ conditions:
     reformulation: true
     verification: false
     seeds: [0, 1, 2]
+    params: {reranking: true}
   - id: "7"
     name: verified_rag_model_a
     model: model_a
@@ -52,6 +58,7 @@ conditions:
     reformulation: false
     verification: true
     seeds: [0, 1, 2]
+    params: {reranking: true}
   - id: "8"
     name: verified_rag_model_b
     model: model_b
@@ -59,6 +66,7 @@ conditions:
     reformulation: false
     verification: true
     seeds: [0, 1, 2]
+    params: {reranking: true}
   - id: "9"
     name: reformulated_verified_rag_model_a
     model: model_a
@@ -66,6 +74,7 @@ conditions:
     reformulation: true
     verification: true
     seeds: [0, 1, 2]
+    params: {reranking: true}
   - id: "10"
     name: reformulated_verified_rag_model_b
     model: model_b
@@ -73,3 +82,4 @@ conditions:
     reformulation: true
     verification: true
     seeds: [0, 1, 2]
+    params: {reranking: true}

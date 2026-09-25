@@ -8,6 +8,7 @@ loading or quantization config here.
 """
 
 from pathlib import Path
+from typing import Any
 
 import yaml
 from pydantic import BaseModel, model_validator
@@ -36,6 +37,14 @@ class RetrievalConfig(BaseModel):
     reranker_model: str
 
 
+class VerifierConfig(BaseModel):
+    min_chunks: int
+
+
+class ReformulatorConfig(BaseModel):
+    max_retries: int
+
+
 class ConditionConfig(BaseModel):
     id: str
     name: str
@@ -44,13 +53,21 @@ class ConditionConfig(BaseModel):
     reformulation: bool
     verification: bool
     seeds: list[int]
+    # Free-form lever parameters discovered useful during exploration (e.g.
+    # {"reranking": true}), so a new exploratory lever never needs its own
+    # typed field.
+    params: dict[str, Any] = {}
 
 
 class ExperimentConfig(BaseModel):
     models: dict[str, ModelConfig]
     retrieval: RetrievalConfig
+    verifier: VerifierConfig
+    reformulator: ReformulatorConfig
     conditions: list[ConditionConfig]
     benchmark: str
+    dev_split: str  # split Phases 5-9 run exploration against, not the test split
+    test_split: str  # split Phase 13's confirmatory run uses
     output_dir: str
 
     @model_validator(mode="after")
