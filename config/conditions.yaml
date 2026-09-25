@@ -1,1 +1,75 @@
-# Experiment condition definitions (which pipeline modules are enabled per condition).
+# 2x2x2 factorial (model x reformulation x verification) + closed-book
+# baselines per model. IDs are ordered to match the delta formulas in
+# experiment/metrics.py: raw_rag = 3/4 - 1/2, reformulation = 5/6 - 3/4,
+# verifier = 7/8 - 3/4, combined = 9/10 - 3/4.
+conditions:
+  - id: "1"
+    name: closed_book_model_a
+    model: model_a
+    retrieval: false
+    reformulation: false
+    verification: false
+    seeds: [0, 1, 2]
+  - id: "2"
+    name: closed_book_model_b
+    model: model_b
+    retrieval: false
+    reformulation: false
+    verification: false
+    seeds: [0, 1, 2]
+  - id: "3"
+    name: raw_rag_model_a
+    model: model_a
+    retrieval: true
+    reformulation: false
+    verification: false
+    seeds: [0, 1, 2]
+  - id: "4"
+    name: raw_rag_model_b
+    model: model_b
+    retrieval: true
+    reformulation: false
+    verification: false
+    seeds: [0, 1, 2]
+  - id: "5"
+    name: reformulated_rag_model_a
+    model: model_a
+    retrieval: true
+    reformulation: true
+    verification: false
+    seeds: [0, 1, 2]
+  - id: "6"
+    name: reformulated_rag_model_b
+    model: model_b
+    retrieval: true
+    reformulation: true
+    verification: false
+    seeds: [0, 1, 2]
+  - id: "7"
+    name: verified_rag_model_a
+    model: model_a
+    retrieval: true
+    reformulation: false
+    verification: true
+    seeds: [0, 1, 2]
+  - id: "8"
+    name: verified_rag_model_b
+    model: model_b
+    retrieval: true
+    reformulation: false
+    verification: true
+    seeds: [0, 1, 2]
+  - id: "9"
+    name: reformulated_verified_rag_model_a
+    model: model_a
+    retrieval: true
+    reformulation: true
+    verification: true
+    seeds: [0, 1, 2]
+  - id: "10"
+    name: reformulated_verified_rag_model_b
+    model: model_b
+    retrieval: true
+    reformulation: true
+    verification: true
+    seeds: [0, 1, 2]

@@ -1,1 +1,22 @@
-# Remote LLM and embedding model definitions (endpoint URLs, model names, generation params).
+# Placeholder values -- replace base_url/api_model_name with your actual
+# served endpoints before running anything for real. api_key_env names an
+# environment variable to read the API key from; no secrets are stored here.
+models:
+  model_a:
+    name: model_a
+    base_url: "http://localhost:8000/v1"
+    api_model_name: "REPLACE_ME"
+    api_key_env: "MODEL_A_API_KEY"
+    max_new_tokens: 512
+    temperature: 0.7
+    top_p: 0.9
+    seed: 0
+  model_b:
+    name: model_b
+    base_url: "http://localhost:8001/v1"
+    api_model_name: "REPLACE_ME"
+    api_key_env: "MODEL_B_API_KEY"
+    max_new_tokens: 512
+    temperature: 0.7
+    top_p: 0.9
+    seed: 0
