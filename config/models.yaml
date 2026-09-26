@@ -1,22 +1,49 @@
-# Placeholder values -- replace base_url/api_model_name with your actual
-# served endpoints before running anything for real. api_key_env names an
-# environment variable to read the API key from; no secrets are stored here.
+# Remote OpenAI-compatible endpoints. api_key_env names an environment
+# variable to read the API key from; no secrets are stored here -- put the
+# keys in the repo's gitignored .env (see .env.example).
+#
+# The two entries are genuinely different models (measured live in Phase 4):
+# an instruct model and a reasoning model, which is what the `model` factor in
+# conditions.yaml needs.
+#
+# max_new_tokens differs per model on purpose. model_a closes at ~235 tokens
+# (finish_reason='stop'), so 1,024 is ~4x headroom. model_b writes its chain of
+# thought into a non-standard `reasoning` field and, at its recommended
+# temperature 0.6, failed to close within 3,072 tokens on 4 of 6 closed-book
+# questions -- 16,384 is the measured worst case at which it still terminates
+# (model_b's served context window is 131,072, so prompt + 16,384 fits). The
+# ceiling is a ceiling, not a target: model_a stops at its own EOS, so a larger
+# ceiling costs it nothing.
+#
+# timeout must cover the whole ceiling: model_b at ~60-78 tok/s takes up to
+# ~4.5 min to exhaust 16,384 tokens, so a 120s timeout would trip the OpenAI
+# SDK's retries and re-run a doomed call up to max_retries+1 times.
+#
+# answer_recovery_max_tokens is the one-shot rescue for a completion that used
+# its whole budget without emitting a parsable ANSWER: line; the row that still
+# fails is recorded as unanswered and scored incorrect.
 models:
   model_a:
     name: model_a
-    base_url: "http://localhost:8000/v1"
-    api_model_name: "REPLACE_ME"
+    base_url: "http://localhost:8081/v1"
+    api_model_name: "/Volumes/Data/mlx/Qwen2.5-7B-Instruct-8bit"
     api_key_env: "MODEL_A_API_KEY"
-    max_new_tokens: 512
+    max_new_tokens: 1024
     temperature: 0.7
     top_p: 0.9
     seed: 0
+    timeout: 300.0
+    max_retries: 2
+    answer_recovery_max_tokens: 512
   model_b:
     name: model_b
-    base_url: "http://localhost:8001/v1"
-    api_model_name: "REPLACE_ME"
+    base_url: "http://localhost:8082/v1"
+    api_model_name: "/Volumes/Data/mlx/DeepSeek-R1-Distill-Qwen-7B-8bit"
     api_key_env: "MODEL_B_API_KEY"
-    max_new_tokens: 512
-    temperature: 0.7
-    top_p: 0.9
+    max_new_tokens: 16384
+    temperature: 0.6
+    top_p: 0.95
     seed: 0
+    timeout: 600.0
+    max_retries: 1
+    answer_recovery_max_tokens: 512

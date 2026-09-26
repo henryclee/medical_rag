@@ -25,6 +25,18 @@ class ModelConfig(BaseModel):
     temperature: float
     top_p: float
     seed: int
+    # HTTP transport policy for LLMClient; defaulted so existing configs need no
+    # change and so the retry/timeout rule lives in config rather than in code.
+    timeout: float = 120.0
+    max_retries: int = 4
+    # One-shot rescue when the first completion carries no parsable ANSWER: line
+    # -- typically a reasoning model that spent the whole budget on its chain of
+    # thought (measured: DeepSeek-R1-Distill-Qwen-7B rambles past 3,072 tokens on
+    # ~2/3 of closed-book questions). LLMClient replays what the model produced
+    # as an assistant turn and asks it to close, using this many tokens. The
+    # final fallback is an unanswered row, scored incorrect. 0 disables the
+    # rescue, so a caller can measure the raw unanswered rate.
+    answer_recovery_max_tokens: int = 0
 
 
 class RetrievalConfig(BaseModel):
