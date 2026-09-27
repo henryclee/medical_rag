@@ -7,13 +7,18 @@
 # conditions.yaml needs.
 #
 # max_new_tokens differs per model on purpose. model_a closes at ~235 tokens
-# (finish_reason='stop'), so 1,024 is ~4x headroom. model_b writes its chain of
-# thought into a non-standard `reasoning` field and, at its recommended
-# temperature 0.6, failed to close within 3,072 tokens on 4 of 6 closed-book
-# questions -- 16,384 is the measured worst case at which it still terminates
-# (model_b's served context window is 131,072, so prompt + 16,384 fits). The
-# ceiling is a ceiling, not a target: model_a stops at its own EOS, so a larger
-# ceiling costs it nothing.
+# (finish_reason='stop'), so 1,024 is ~4x headroom -- confirmed in Phase 5:
+# 0/20 rows hit the cap, worst case 475 tokens (experiments/phase5/FINDINGS.md).
+# model_b writes its chain of thought into a non-standard `reasoning` field and,
+# at its recommended temperature 0.6, does not reliably close: in Phase 5, 2 of
+# its 3 completions looped on "Alternatively" through all 16,384 tokens and
+# emitted no answer text at all (content_chars=0). So 16,384 is an UNVERIFIED
+# ceiling -- NOT the "measured worst case at which it still terminates" this
+# comment previously claimed, which that run falsifies. Raising it buys more
+# minutes of the same loop, not termination (Open questions item 13). model_b's
+# served context window is 131,072, so prompt + 16,384 fits. The ceiling is a
+# ceiling, not a target: model_a stops at its own EOS, so a larger ceiling costs
+# it nothing.
 #
 # timeout must cover the whole ceiling: model_b at ~60-78 tok/s takes up to
 # ~4.5 min to exhaust 16,384 tokens, so a 120s timeout would trip the OpenAI
@@ -29,6 +34,10 @@
 # repetition_penalty=1.05, but neither is plumbed through ModelConfig /
 # LLMClient today (only temperature/top_p/seed/max_new_tokens are sent) --
 # adding them needs an extra_body passthrough, not just a value change here.
+# That passthrough is no longer just tuning: mlx_lm.server accepts per-request
+# repetition_penalty / presence_penalty / top_k / min_p / stop and defaults
+# repetition_penalty to 0.0 (off), so it is the blocking path for model_b's
+# repetition loops (open question 13).
 models:
   model_a:
     name: model_a
