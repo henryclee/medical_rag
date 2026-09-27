@@ -22,6 +22,13 @@
 # answer_recovery_max_tokens is the one-shot rescue for a completion that used
 # its whole budget without emitting a parsable ANSWER: line; the row that still
 # fails is recorded as unanswered and scored incorrect.
+#
+# model_a's temperature/top_p (0.7/0.8) are Qwen2.5-7B-Instruct's own
+# recommended values, from its published generation_config.json (open
+# question 8). That config also recommends top_k=20 and
+# repetition_penalty=1.05, but neither is plumbed through ModelConfig /
+# LLMClient today (only temperature/top_p/seed/max_new_tokens are sent) --
+# adding them needs an extra_body passthrough, not just a value change here.
 models:
   model_a:
     name: model_a
@@ -30,7 +37,7 @@ models:
     api_key_env: "MODEL_A_API_KEY"
     max_new_tokens: 1024
     temperature: 0.7
-    top_p: 0.9
+    top_p: 0.8
     seed: 0
     timeout: 300.0
     max_retries: 2
