@@ -6,23 +6,37 @@
 # an instruct model and a reasoning model, which is what the `model` factor in
 # conditions.yaml needs.
 #
+# ONE SERVER SERVES BOTH. Since the run below, both arms point at one oMLX
+# instance (omlx-server, :8080) that pools 12 models, not at two mlx_lm.server
+# instances on :8081/:8082 as earlier notes and environment.md still describe.
+# Two consequences: (a) `api_model_name` must be the id oMLX advertises on
+# GET /v1/models -- the bare name, NOT a filesystem path; the full path returns
+# HTTP 404 "Model ... not found", which `closed_book.py`'s preflight now catches
+# before any request is fired. (b) The arms share one GPU process, so they are
+# NOT independent endpoints any more: run them sequentially, and treat any
+# per-arm tok/s from a concurrent run as confounded (PLAN item 12's premise
+# that the two arms run concurrently "for free" no longer holds).
+#
+# api_model_name is load-bearing: it is both the OpenAI `model` field and the
+# key the endpoint's per-model sampling settings are stored under.
+#
 # max_new_tokens differs per model on purpose. model_a closes at ~235 tokens
 # (finish_reason='stop'), so 1,024 is ~4x headroom -- confirmed in Phase 5:
 # 0/20 rows hit the cap, worst case 475 tokens (experiments/phase5/FINDINGS.md).
-# model_b writes its chain of thought into a non-standard `reasoning` field and,
-# at its recommended temperature 0.6, does not reliably close: in Phase 5, 2 of
-# its 3 completions looped on "Alternatively" through all 16,384 tokens and
-# emitted no answer text at all (content_chars=0). So 16,384 is an UNVERIFIED
-# ceiling -- NOT the "measured worst case at which it still terminates" this
-# comment previously claimed, which that run falsifies. Raising it buys more
-# minutes of the same loop, not termination (Open questions item 13). model_b's
-# served context window is 131,072, so prompt + 16,384 fits. The ceiling is a
-# ceiling, not a target: model_a stops at its own EOS, so a larger ceiling costs
-# it nothing.
+# model_b writes its chain of thought into a non-standard reasoning field and,
+# at its recommended temperature 0.6, does not reliably close: in the first
+# Phase 5 run 2 of its 3 completions looped on "Alternatively" through all
+# 16,384 tokens and emitted no answer text at all (content_chars=0). The fix is
+# a constraint that makes it commit, not a bigger ceiling -- raising it only
+# bought 4.5 more minutes of the same loop (Open questions item 13). 8,096 is
+# the ceiling under test in the re-run; the constraint that is supposed to make
+# it terminate (a 4,096-token thinking budget plus top_k=40) is applied
+# ENDPOINT-SIDE in ~/.omlx/model_settings.json, not by this repo -- see the
+# note in context.md for the values a given run actually ran under.
 #
-# timeout must cover the whole ceiling: model_b at ~60-78 tok/s takes up to
-# ~4.5 min to exhaust 16,384 tokens, so a 120s timeout would trip the OpenAI
-# SDK's retries and re-run a doomed call up to max_retries+1 times.
+# timeout must cover the whole ceiling: at ~60-80 tok/s, 8,096 tokens is ~2 min,
+# so 300s leaves headroom. A timeout below the ceiling's worst case would trip
+# the OpenAI SDK's retries and re-run a doomed call up to max_retries+1 times.
 #
 # answer_recovery_max_tokens is the one-shot rescue for a completion that used
 # its whole budget without emitting a parsable ANSWER: line; the row that still
@@ -42,7 +56,7 @@ models:
   model_a:
     name: model_a
     base_url: "http://localhost:8080/v1"
-    api_model_name: "/Volumes/Data/mlx/Qwen2.5-7B-Instruct-8bit"
+    api_model_name: "Qwen2.5-7B-Instruct-8bit"
     api_key_env: "MODEL_A_API_KEY"
     max_new_tokens: 1024
     temperature: 0.7
@@ -53,11 +67,11 @@ models:
   model_b:
     name: model_b
     base_url: "http://localhost:8080/v1"
-    api_model_name: "/Volumes/Data/mlx/DeepSeek-R1-Distill-Qwen-7B-8bit"
+    api_model_name: "DeepSeek-R1-Distill-Qwen-7B-8bit"
     api_key_env: "MODEL_B_API_KEY"
     max_new_tokens: 8096
     temperature: 0.6
     top_p: 0.95
-    timeout: 600.0
+    timeout: 300.0
     max_retries: 1
     answer_recovery_max_tokens: 512

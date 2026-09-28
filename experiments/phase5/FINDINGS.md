@@ -1,28 +1,37 @@
 # Phase 5 — Closed-book smoke test findings
 
-> **Status: PARTIAL. Phase 5 is not complete and this is not the phase's final
-> word.** The harness (`scripts/exploration/closed_book.py`) works — sample
-> pinning, per-row param snapshots, chain capture, `--resume`, and the seed check
-> all behaved. What did not work is the thing the phase exists to measure:
-> `model_b` does not reliably reach an answer inside its budget, and its endpoint
-> died mid-run, so 17 of its 20 rows never got a completion. `model_a`'s half is
-> measured and reported here; `model_b`'s is not. §7 is the punch list a
-> completing run needs. Exploratory evidence, dev split only — not a result (see
-> `../README.md`).
+> **Status: COMPLETE as of run `20260928T020841Z` (§8): both arms, 40/40 rows,
+> zero errors, zero truncations.** §1–§7 describe the first run
+> (`20260927T162758Z`) and stand as the record of what broke: `model_b` would not
+> terminate (2 of its 3 completions looped to the 16,384-token ceiling and
+> returned `content_chars=0`) and its endpoint died mid-run, so 17 of its 20 rows
+> never got a completion. The fix landed **endpoint-side, not in this repo** — a
+> 4,096-token thinking budget plus `top_k=40` in `~/.omlx/model_settings.json`,
+> on an oMLX server that now serves both arms — and it turned each of those
+> 4.5-minute non-answers into a 9–58 s `finish_reason="stop"` with a parsable
+> `ANSWER:` line. **§8 is the measurement Phase 6 and Phase 10 should cite**; the
+> `model_b` column below is not a measurement of the model at all. Exploratory
+> evidence, dev split only — not a result (see `../README.md`).
 
-- **Date / git rev:** run `20260927T162758Z` @ `be8797b`. The harness itself was
-  untracked when the run executed (`scripts/exploration/`,
+- **Run 1 (history, §1–§7) — date / git rev:** run `20260927T162758Z` @ `be8797b`.
+  The harness itself was untracked when the run executed (`scripts/exploration/`,
   `tests/test_exploration_common.py` and this directory are all still `??` in
   `git status`), so `be8797b` does **not** identify the code that produced these
   rows. Commit them before the next run.
-- **Command:** `.venv/bin/python scripts/exploration/closed_book.py --sample-size 20`
+- **Run 1 — command:** `.venv/bin/python scripts/exploration/closed_book.py --sample-size 20`
   (default checks `main` + `seed`; both models; models sequential, not
   `--concurrent-models`)
-- **Raw artifacts:** `outputs/exploration/phase5/20260927T162758Z/`
+- **Run 1 — raw artifacts:** `outputs/exploration/phase5/20260927T162758Z/`
   (`results.jsonl`, `context.md`, `seed_check.md`, 31 chains). The stdout
   transcript was written to `/tmp/phase5_full.log` and has been copied to
   `outputs/exploration/phase5/20260927T162758Z/run.log` — `/tmp` would not have
   survived the week.
+- **Run 2 (the measurement, §8) — raw artifacts:**
+  `outputs/exploration/phase5/20260928T020841Z/` (`results.jsonl`, `context.md`,
+  40 chains, `run.log`). A **fresh dir rather than `--resume`**, because both the
+  ceiling (16,384 → 8,096) and the endpoint changed between the runs; §8's
+  `model_a` drift — 5 of 20 answers moved with nothing edited in this repo — is
+  the evidence that the two runs' rows do not belong in one `results.jsonl`.
 - **Sample — pin these ids, Phase 6 must reuse exactly them** (also in
   `context.md`; `--sample-seed` is the script default):
   `1312 2391 3998 4002 5209 5949 6205 6264 6727 6753 6771 7159 7502 7553 8966
@@ -44,7 +53,7 @@ Three decisions, plus one artifact:
 4. **Artifact:** the pinned 20-question sample Phase 6 reuses, so "the same 20
    questions" is a fact rather than a hope.
 
-## 2. Numbers
+## 2. Numbers (run 1 — the `model_b` column is not a measurement; see §8)
 
 `n` counts rows in `tag="main"`. model_b's 17 "no completion" rows are the
 endpoint dying (§7), not model behaviour; they are excluded from every
@@ -200,6 +209,19 @@ Plan Phase 13's cost only from a post-fix Phase 5.
 
 ## 7. What blocked the run, and what a completing run needs
 
+> **Status (2026-09-28): every item below landed, and run 2 (§8) proves it —
+> 40/40 rows, 0 errors.** `completed_keys()` now ignores error rows, `error_row()`
+> carries `params` plus the cost fields, and `EndpointCircuitBreaker` abandons an
+> arm after 3 consecutive transport failures; the `model_b` non-termination
+> blocker was cleared **endpoint-side**, not in this repo. One item did *not*
+> land: loop-aware recovery. With 0/40 recoveries firing it stayed unreachable, so
+> `_recover_answer` replaying a loop to itself stands as an open hazard (§8.4),
+> not a fix. The procedure below is kept verbatim as the record; its
+> `mlx_lm.server` command and its "strip the error rows" workaround are both
+> obsolete — the workaround is now what `completed_keys()` does unprompted, so a
+> plain `--resume` needs no surgery.
+
+
 Timeline, reconstructed from `results.jsonl` timestamps (each stamped at
 completion) and `run.log`:
 
@@ -302,6 +324,116 @@ is no longer a field on `ModelConfig`, `ConditionConfig`, `LLMClient`, or
 condition instead of three per seed (see `PLAN.md`, open question 10). The
 `main` findings above and this file's raw artifacts are unaffected and remain
 the historical record; only the seed-check follow-up work is now moot.
+
+## 8. Run 2 (`20260928T020841Z`) — the completed measurement
+
+Both arms ran to completion: **40/40 rows, 0 errors, 0 `finish_reason="length"`,
+0 recoveries fired, 9.3 min of GPU wall for 40 completions (37,527 completion
+tokens).** Phase 5's question is now answered for both models.
+
+### 8.1 What changed between the runs — one of the three is not in this repo
+
+1. **The backend moved, and quietly.** Both arms now point at one **oMLX** process
+   on `:8080`; `GET /v1/models` advertises **bare ids** (`Qwen2.5-7B-Instruct-8bit`,
+   `DeepSeek-R1-Distill-Qwen-7B-8bit`). `models.yaml` still carried
+   `/Volumes/Data/mlx/...` paths, which oMLX answers with `HTTP 404 Model ... not
+   found` — and the harness's own preflight caught it before the first request
+   fired, which is the only reason this cost seconds instead of 40 error rows. The
+   two `mlx_lm.server` instances on `:8081`/`:8082` that `environment.md` still
+   describes are gone; `models.yaml`'s header now says so. One process serving
+   both arms also means the arms are no longer independent endpoints, so
+   `--concurrent-models` would confound per-arm tok/s — they ran sequentially.
+2. **The non-termination fix is endpoint-side.** `~/.omlx/model_settings.json`
+   for `DeepSeek-R1-Distill-Qwen-7B-8bit` now carries
+   `thinking_budget_enabled: true`, `thinking_budget_tokens: 4096`,
+   `enable_thinking: true`, `top_k: 40`. `LLMClient` sends only
+   `max_completion_tokens`/`temperature`/`top_p`, so **nothing in git produced
+   this fix** — it is recorded in the run's `context.md` via the new `--note`
+   channel. Consequence for item 13(a): the `extra_body` passthrough is *not*
+   needed to make `model_b` terminate. It stays worth doing the first time a
+   phase needs to *vary* one of those knobs per condition, which Phase 6+ does
+   not currently plan to.
+3. **In this repo:** `api_model_name` paths → bare ids for both models,
+   `model_b`'s ceiling 16,384 → 8,096, and §7's three harness fixes
+   (`completed_keys()` no longer counts error rows, `error_row()` carries
+   `params`/`question`/cost fields, `EndpointCircuitBreaker` aborts an arm after
+   3 consecutive transport failures) — plus `--note`. 72 tests pass, 8 of them new.
+   **Provenance caveat, the same one §"Run 1" reproaches run 1 for:** run 2 executed
+   at HEAD `a9fb100` *plus an uncommitted working tree* containing everything in
+   this numbered list, so no rev identifies the code that produced these rows.
+   Commit before Phase 6 runs, or the ambiguity recurs a second time.
+
+### 8.2 Numbers (n=20 per arm, `tag="main"`)
+
+| model | n | completions | correct | unanswered | `finish=length` | recovery fired/worked | median tok/s | median wall s | tokens median/max (cap) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `model_a` (1,024) | 20 | 20 | **14 (70%)**, Wilson 95% [48%, 85%] | 0 | 0 | 0 / 0 | 72.7 | 5.2 | 377 / 512 — 50% of cap |
+| `model_b` (8,096) | 20 | 20 | **5 (25%)**, Wilson 95% [11%, 47%] | 0 | 0 | 0 / 0 | 73.5 | 19.1 | 1,327 / 4,237 — 52% of cap |
+
+Wrong-answer letters: `model_a` D×2 C×1 B×2 A×1 (n=6); `model_b` C×5 B×5 D×3 A×2
+(n=15). Against gold C×8 A×5 D×4 B×3 — no letter signal is extractable from these
+at n=20, and neither arm produced an unparsable row.
+
+**The loop is gone, measured on the two questions that produced it:**
+
+| question | run 1 | run 2 |
+| --- | --- | --- |
+| q1312 | `length`, 16,896 tok, `content_chars=0`, "Alternatively"×1,034, 264 s | `stop`, 1,091 tok, "Alternatively"×3, `ANSWER: C`, 14.6 s |
+| q2391 | `length`, 16,896 tok, `content_chars=0`, "Alternatively"×349 | `stop`, 1,954 tok, "Alternatively"×2, `ANSWER: C`, 26.3 s |
+
+Worst chain across all 20 run-2 `model_b` completions: "Alternatively"×20 at
+14 KB (`q10064`) vs ×1,034 at 76 KB before. Both questions above are *wrong*
+(gold B) — that is now legitimate Phase 5 evidence rather than plumbing failure.
+
+### 8.3 What this settles
+
+* **Item 8 closes for both arms**, with headroom measured on real MedQA
+  questions: the worst case used 50% (`model_a`) and 52% (`model_b`) of its
+  ceiling, 0/40 truncated. The `--caps` sweep is no longer needed to justify the
+  ceilings at this n. The sizing *rule* changed in kind, though: `model_b`'s
+  ceiling is now structurally ~2× the endpoint's 4,096-token thinking budget, so
+  **the budget — not `max_new_tokens` — is what bounds a chain.**
+* **Item 13 closes** on termination, and by a decoding constraint rather than a
+  bigger ceiling — exactly the shape the item guessed at ("raising
+  `max_new_tokens` is not the fix"). 264 s of non-answer per question became
+  14.6–26.3 s of answer.
+* **Item 12's circuit-breaker half and the `--resume` trap are fixed**, with tests
+  that fail if either regresses. Phase 9's resumability claim inherits the
+  corrected `completed_keys()` rule rather than run 1's broken one.
+
+### 8.4 What this does not settle
+
+* **`model_a`'s 70% is not an improvement over run 1's 50%.** Same pinned 20
+  questions, same `temperature`/`top_p` in `models.yaml`, same code path — and yet
+  **5/20 answers moved (q10064, 5949, 6205, 6727, 9473) and 0/20 outputs were
+  byte-identical.** What changed is the endpoint's per-model sampling
+  (`top_k=20`, `top_p=0.8`, `repetition_penalty=1.05`), which lives outside git.
+  Two consequences: the two runs' rows must not be pooled, and **Phase 10's freeze
+  is not reproducible unless the endpoint's per-model settings are recorded next to
+  the repo's `params`.** That is item 9's argument, upgraded from "a row's params
+  may be incomplete" to "parameters no artifact in this repo names moved accuracy
+  by 20 points on n=20."
+* **The budget's tail is unmeasured, and Phase 13 will hit it.** q9572 reached
+  4,237 tokens (~3,900 of it reasoning) — within 5% of the 4,096 budget — and its
+  chain still concludes coherently ("In conclusion, despite the normal amylase…"),
+  so nothing was cut off at n=20. At n=1,273 the budget *will* bind, and what
+  happens then — answer forced, chain truncated, or loop reinstated — is unknown.
+  Before Phase 13, either re-run the pinned 20 with the budget raised and compare,
+  or adopt the budget as part of the frozen definition of `model_b` and say so.
+* **Item 13(b) — the recovery path feeding a loop back to itself — is unexercised,
+  not fixed.** Recovery fired 0/40 times, because nothing came back unanswered, so
+  `_recover_answer`'s loop-replay hazard (`llm.py:297-328`) is still in the code
+  and still untested against a genuine loop. The endpoint fix routed around it; it
+  did not remove it.
+* **`model_b` 25% vs `model_a` 70%** is the first plumbing-clean contrast between
+  the arms, and at n=20 the intervals ([11%, 47%] vs [48%, 85%]) only just clear
+  each other. One hypothesis worth a cheap test before it hardens into an
+  assumption: forcing a commitment at 4,096 reasoning tokens may be *what costs*
+  the reasoning model, since its chains show it deliberating past the point of
+  sufficiency ("I'm going to have to make a decision… Alternatively, maybe the
+  answer is D"). Not a finding — a 20-question A/B against a larger budget would
+  settle it.
+
 
 
 

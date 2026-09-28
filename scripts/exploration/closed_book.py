@@ -58,6 +58,7 @@ from medical_rag.generation.prompt import build_answer_prompt
 
 from _common import (
     DEFAULT_SAMPLE_SEED,
+    EndpointCircuitBreaker,
     RunWriter,
     error_row,
     result_row,
@@ -122,6 +123,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="pin and print the sample and the planned call count; fire no requests",
     )
+    parser.add_argument(
+        "--note",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="record a fact about this run in context.md; repeatable. Needed because "
+        "the endpoint now applies per-model sampling (top_k, thinking budget, "
+        "repetition penalty) from its OWN config, which lives outside this repo "
+        "and outside git -- without a note, a row's `params` understates what "
+        "actually produced it (open question 9).",
+    )
     return parser.parse_args()
 
 
@@ -169,6 +181,7 @@ async def run_main_check(
     split: str,
     writer: RunWriter,
     done: set[tuple[str, str, str]],
+    breaker: EndpointCircuitBreaker,
 ) -> list[str]:
     """One closed-book completion per sampled question, at the model's own budget.
 
@@ -182,6 +195,10 @@ async def run_main_check(
         if (model.name, question.id, "main") in done:
             logger.info("{}/{} already logged -- skipping (resume)", model.name, question.id)
             continue
+
+        if breaker.tripped:
+            problems.append(breaker.abort_problem(len(questions) - index + 1))
+            break
 
         prompt = build_answer_prompt(question.question, question.options, None)
         started = time.perf_counter()
@@ -197,10 +214,14 @@ async def run_main_check(
                     split=split,
                     exc=exc,
                     wall_s=time.perf_counter() - started,
+                    prompt=prompt,
                 )
             )
             problems.append(f"{model.name}/q{question.id}: {exc}")
+            breaker.record_failure(exc)
             continue
+
+        breaker.record_success()
 
         row = writer.write_row(
             result_row(
@@ -253,6 +274,7 @@ async def run_caps_check(
     split: str,
     writer: RunWriter,
     done: set[tuple[str, str, str]],
+    breaker: EndpointCircuitBreaker,
 ) -> list[str]:
     """Re-run a few questions under a lower `max_new_tokens` ceiling.
 
@@ -263,11 +285,15 @@ async def run_caps_check(
     """
     problems: list[str] = []
 
-    for question in questions:
+    for index, question in enumerate(questions, start=1):
         tag = f"cap{cap}"
         if (model.name, question.id, tag) in done:
             logger.info("{}/{} already logged -- skipping (resume)", model.name, question.id)
             continue
+
+        if breaker.tripped:
+            problems.append(breaker.abort_problem(len(questions) - index + 1))
+            break
 
         prompt = build_answer_prompt(question.question, question.options, None)
         started = time.perf_counter()
@@ -283,10 +309,14 @@ async def run_caps_check(
                     split=split,
                     exc=exc,
                     wall_s=time.perf_counter() - started,
+                    prompt=prompt,
                 )
             )
             problems.append(f"{model.name}/q{question.id}[{tag}]: {exc}")
+            breaker.record_failure(exc)
             continue
+
+        breaker.record_success()
 
         row = writer.write_row(
             result_row(
@@ -361,6 +391,24 @@ def print_plan(
     print("  (rows flush as they complete; Ctrl-C is safe, resume with --resume <run dir>)")
 
 
+def parse_notes(notes: list[str]) -> dict[str, str]:
+    """Turn repeated `--note KEY=VALUE` strings into `context.md`'s note rows.
+
+    The endpoint now supplies sampling parameters this repo never sees or sends
+    (oMLX keeps them in `~/.omlx/model_settings.json`, outside git), so
+    `params_snapshot()` understates what actually produced a row. A note is how a
+    run records what it otherwise could not prove -- e.g. the 4,096-token thinking
+    budget that is the reason `model_b` terminates at all (open question 9).
+    """
+    parsed: dict[str, str] = {}
+    for note in notes:
+        key, sep, value = note.partition("=")
+        if not sep or not key.strip():
+            raise SystemExit(f"--note expects KEY=VALUE, got {note!r}")
+        parsed[key.strip()] = value.strip()
+    return parsed
+
+
 async def amain(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     keys = args.models or list(config.models)
@@ -407,6 +455,7 @@ async def amain(args: argparse.Namespace) -> int:
                 "concurrent_models": args.concurrent_models,
                 "scoring note": "parsed_answer is recomputed against each question's own "
                 "option letters, not GenerationResult.parsed_answer's hardcoded ABCDE",
+                **parse_notes(args.note),
             },
         )
         print(f"run dir: {writer.dir}\n", flush=True)
@@ -420,6 +469,12 @@ async def amain(args: argparse.Namespace) -> int:
             except LLMError as exc:
                 return [f"{key}: {exc}"]
 
+            # One breaker per arm: both arms now share one oMLX process, so a
+            # failure in `model_a`'s calls says nothing about `model_b`'s queue,
+            # and abandoning the wrong arm would cost rows the other could still
+            # have answered.
+            breaker = EndpointCircuitBreaker(model.name)
+
             async with client:
                 blocked = await preflight(model, client)
                 if blocked:
@@ -428,7 +483,7 @@ async def amain(args: argparse.Namespace) -> int:
 
                 if "main" in args.checks:
                     problems += await run_main_check(
-                        model, client, sample, config.dev_split, writer, done
+                        model, client, sample, config.dev_split, writer, done, breaker
                     )
                 for cap in args.caps or []:
                     problems += await run_caps_check(
@@ -439,6 +494,7 @@ async def amain(args: argparse.Namespace) -> int:
                         config.dev_split,
                         writer,
                         done,
+                        breaker,
                     )
             return problems
 

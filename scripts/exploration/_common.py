@@ -47,6 +47,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+import openai
 from loguru import logger
 
 from medical_rag.config import ExperimentConfig, ModelConfig
@@ -215,9 +216,19 @@ class RunWriter:
         return row
 
     def completed_keys(self) -> set[tuple[str, str, str]]:
-        """`(model, question_id, tag)` triples already present in results.jsonl."""
+        """`(model, question_id, tag)` triples that earned a completion.
+
+        Error rows are deliberately NOT included. A row written by `error_row()`
+        records that a call was *attempted and failed* (endpoint down, HTTP 5xx),
+        not that the question was answered; counting it as done made `--resume`
+        skip the exact questions that never ran. That trap cost the first Phase 5
+        run 17 silent no-ops (`experiments/phase5/FINDINGS.md` §7), and Phase 9's
+        resumability claim would have inherited it. A row that legitimately came
+        back unanswered-but-answered (no parsable ANSWER:) *does* count: it is a
+        measured outcome, not a lost request.
+        """
         return {(row.get("model", "?"), row.get("question_id", "?"), row.get("tag", "?"))
-                for row in self.load_rows()}
+                for row in self.load_rows() if "error" not in row}
 
     def load_rows(self) -> list[dict[str, Any]]:
         """Every row on disk, so a resumed run summarizes the whole run.
@@ -426,27 +437,121 @@ def error_row(
     split: str,
     exc: Exception,
     wall_s: float,
+    prompt: str = "",
 ) -> dict[str, Any]:
     """A row for a call that never produced a completion.
 
     Recorded rather than raised away: one dead question must not cost the other
     nineteen, and "the endpoint was down for this id" is itself evidence.
+
+    The row keeps the same keys as `result_row()` wherever it can, including
+    `params`. Open question 9's whole argument is that a row must be readable
+    without re-joining `models.yaml`, and an aborted row is the one most likely
+    to be read months later against an edited config -- the first Phase 5 run's
+    error rows carried no `params` at all, which is the counterexample that
+    fixed this. `finish_reason` and `tok_s` stay None and `completion_tokens`
+    stays null: there was no completion to have them for. That is different from
+    zero, which would claim a measured-empty generation.
     """
     return {
         "condition_id": condition_id,
         "tag": tag,
         "question_id": question.id,
         "split": split,
+        "question": question.question,
+        "reformulated_query": None,
+        "retrieved_chunk_ids": [],
+        "verifier_decisions": None,
         "model": model.name,
         "api_model": model.api_model_name,
         "endpoint": model.base_url,
         "correct_answer": question.answer_idx.upper(),
+        "raw_model_output": "",
         "parsed_answer": None,
         "is_correct": False,
+        "unanswered": True,
+        "truncated": False,
+        "finish_reason": None,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "tok_s": None,
+        "prompt_chars": len(prompt),
+        "content_chars": 0,
+        "reasoning_chars": 0,
+        "recovery_attempted": False,
+        "recovered": False,
+        "params": params_snapshot(model),
         "error": f"{type(exc).__name__}: {str(exc)[:300]}",
         "wall_s": round(wall_s, 1),
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
+
+
+class EndpointCircuitBreaker:
+    """Give up on an arm whose endpoint has died, instead of draining the queue.
+
+    Phase 5's first run lost minutes to exactly this: the `model_b` server died
+    under an in-flight request, and the harness then faithfully fired 17 more
+    completions at a dead port, each logging a row that reads like a model
+    failure (`experiments/phase5/FINDINGS.md` §7). Transport failure is not data,
+    and a dead endpoint does not recover because you asked it nineteen more times.
+
+    Classification is by the underlying `openai` exception, not by message text:
+    `LLMClient._complete()` raises `LLMError(...) from exc`, so `__cause__` still
+    carries the real one. Connection/timeout and 5xx errors count toward the
+    threshold; an auth rejection trips at once, since every later call would fail
+    identically. A 4xx other than auth does not count -- that is bad input, which
+    one question can plausibly trigger on its own. A completion that came back
+    with no parsable `ANSWER:` never reaches here: `agenerate()` returns those,
+    and they are measured outcomes rather than failures.
+    """
+
+    def __init__(self, model_name: str, threshold: int = 3) -> None:
+        self.model_name = model_name
+        self.threshold = threshold
+        self.consecutive = 0
+        self.reason: str | None = None
+
+    @property
+    def tripped(self) -> bool:
+        return self.reason is not None
+
+    def record_success(self) -> None:
+        """One live response clears the streak -- this counts *consecutive* refusals."""
+        self.consecutive = 0
+
+    def record_failure(self, exc: BaseException) -> None:
+        """Count one failed call against the endpoint, tripping if it looks dead."""
+        cause = exc.__cause__
+        if isinstance(cause, openai.AuthenticationError):
+            self._trip(f"endpoint rejected the key ({str(cause)[:150]})")
+            return
+        if isinstance(cause, openai.APIStatusError) and cause.status_code < 500:
+            return
+        if isinstance(cause, (openai.APIConnectionError, openai.APIStatusError)):
+            self.consecutive += 1
+            if self.consecutive >= self.threshold:
+                self._trip(
+                    f"{self.consecutive} consecutive transport failures "
+                    f"({type(cause).__name__}: {str(cause)[:150]})"
+                )
+
+    def _trip(self, reason: str) -> None:
+        self.reason = reason
+        logger.error(
+            "circuit breaker tripped for '{}': {} -- abandoning this arm instead of "
+            "firing further requests at it",
+            self.model_name,
+            reason,
+        )
+
+    def abort_problem(self, skipped: int) -> str:
+        """The problems-list line an abandoned arm must produce, sized by what it cost."""
+        return (
+            f"{self.model_name}: ABANDONED, endpoint went away ({self.reason}) -- "
+            f"{skipped} question(s) never attempted. These are missing rows, not "
+            f"model failures, and must not be read as either."
+        )
 
 
 def percentile(values: Sequence[float], q: float) -> float | None:

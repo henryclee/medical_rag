@@ -17,11 +17,13 @@ import random
 import sys
 from pathlib import Path
 
+import httpx
+import openai
 import pytest
 
 from medical_rag.config import ModelConfig
 from medical_rag.data.load_medqa import MedQAQuestion
-from medical_rag.generation.llm import GenerationResult
+from medical_rag.generation.llm import GenerationResult, LLMError
 
 _MODULE_NAME = "exploration_common"
 _PATH = Path(__file__).resolve().parents[1] / "scripts" / "exploration" / "_common.py"
@@ -281,3 +283,129 @@ def test_error_rows_are_counted_out_of_accuracy_but_not_lost(common, tmp_path):
 def test_percentile_of_nothing_is_not_zero(common):
     assert common.percentile([], 0.5) is None
     assert common.percentile([3, 1, 2], 0.5) == 2
+
+
+# --- the three fixes the first Phase 5 run asked for (FINDINGS.md §7) ---------
+
+_REQUEST = httpx.Request("POST", "http://127.0.0.1:8082/v1/chat/completions")
+
+
+def _llm_error(cause: BaseException | None) -> LLMError:
+    """An `LLMError` shaped like the ones `LLMClient._complete()` raises."""
+    error = LLMError("the call failed")
+    error.__cause__ = cause
+    return error
+
+
+def test_an_error_row_is_not_treated_as_a_completed_question(common, tmp_path):
+    """The `--resume` trap that silently skipped 17 questions.
+
+    An error row records a failed attempt, not an answer. If it counts as done,
+    resuming a run whose endpoint died re-answers the questions that already
+    succeeded and never touches the ones that never ran.
+    """
+    writer = common.RunWriter("phase5", root=tmp_path)
+    writer.write_row(_row(common, question=_question(1, "A")))
+    writer.write_row(
+        common.error_row(
+            model=_model(),
+            question=_question(2, "A"),
+            tag="main",
+            condition_id="phase5_closed_book",
+            split="dev",
+            exc=RuntimeError("connection error"),
+            wall_s=1.0,
+        )
+    )
+    assert writer.completed_keys() == {("model_a", "1", "main")}
+    writer.close()
+
+    resumed = common.RunWriter("phase5", run_dir=writer.dir)
+    assert resumed.completed_keys() == {("model_a", "1", "main")}
+    resumed.close()
+
+
+def test_an_error_row_carries_every_key_a_result_row_does(common):
+    """A row must be readable without re-joining `models.yaml` to interpret it.
+
+    The first run's error rows had no `params` at all, which is the counterexample
+    open question 9 rests on; this keeps `error_row()` and `result_row()` from
+    drifting apart again.
+    """
+    missing = set(_row(common)) - set(
+        common.error_row(
+            model=_model(),
+            question=_question(1, "A"),
+            tag="main",
+            condition_id="phase5_closed_book",
+            split="dev",
+            exc=RuntimeError("boom"),
+            wall_s=1.0,
+        )
+    )
+    assert missing == set()
+
+
+def _breaker_trips_after(common, cause: BaseException, attempts: int) -> bool:
+    breaker = common.EndpointCircuitBreaker("model_b")
+    for _ in range(attempts):
+        breaker.record_failure(_llm_error(cause))
+    return breaker.tripped
+
+
+def test_the_breaker_trips_on_repeated_transport_failure_but_not_once(common):
+    """Three in a row, never one.
+
+    The cause must be the exception the client actually attaches: `LLMClient`
+    wraps httpx's own errors in `openai.APIConnectionError` before re-raising, so
+    a raw `httpx.ConnectError` is not the shape that arrives and must not count.
+    `APITimeoutError` subclasses `APIConnectionError`, so a request that outlives
+    `timeout` -- how Phase 5's first run died -- counts the same as a refused port.
+    """
+    refused = openai.APIConnectionError(request=_REQUEST)
+    assert not _breaker_trips_after(common, refused, 1)
+    assert not _breaker_trips_after(common, refused, 2)
+    assert _breaker_trips_after(common, refused, 3)
+    assert _breaker_trips_after(common, openai.APITimeoutError(request=_REQUEST), 3)
+    assert _breaker_trips_after(
+        common,
+        openai.APIStatusError(
+            "overloaded", response=httpx.Response(503, request=_REQUEST), body=None
+        ),
+        3,
+    )
+
+
+def test_the_breaker_ignores_a_single_bad_request(common):
+    """A 4xx is one question's fault, not the endpoint dying."""
+    client_error = openai.APIStatusError(
+        "bad request", response=httpx.Response(400, request=_REQUEST), body=None
+    )
+    assert not _breaker_trips_after(common, client_error, 5)
+
+
+def test_the_breaker_trips_at_once_on_a_rejected_key(common):
+    """Every later call would fail identically, so do not make twenty more."""
+    unauthorized = openai.AuthenticationError(
+        "nope", response=httpx.Response(401, request=_REQUEST), body=None
+    )
+    assert _breaker_trips_after(common, unauthorized, 1)
+
+
+def test_a_live_response_clears_the_streak(common):
+    breaker = common.EndpointCircuitBreaker("model_b")
+    dead = openai.APIConnectionError(request=_REQUEST)
+    breaker.record_failure(_llm_error(dead))
+    breaker.record_failure(_llm_error(dead))
+    breaker.record_success()
+    assert breaker.consecutive == 0
+    breaker.record_failure(_llm_error(dead))
+    assert not breaker.tripped
+
+
+def test_an_abandoned_arm_is_reported_as_missing_rows_not_failures(common):
+    breaker = common.EndpointCircuitBreaker("model_b")
+    for _ in range(3):
+        breaker.record_failure(_llm_error(openai.APIConnectionError(request=_REQUEST)))
+    problem = breaker.abort_problem(17)
+    assert "model_b" in problem and "17" in problem and "missing rows" in problem
