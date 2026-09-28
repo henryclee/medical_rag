@@ -31,6 +31,11 @@ Apple Silicon GPU, so `--concurrent-models` would trade the per-model tok/s
 that Phase 13's wall-clock estimate depends on for a shorter wall clock here.
 The concurrency sweep belongs to Phase 9 (open question 12).
 
+Run one arm over the pinned Phase 5 sample (all 20 questions x both models = 40
+calls; `--limit` shrinks it for a live check). Results land in a new timestamped
+folder under `--output-dir`, which defaults to `outputs/exploration/<script-stem>/`
+-- e.g. `outputs/exploration/closed_book/20260927T162758Z/`.
+
 Cost warning: `model_b` writes a chain of thought into a non-standard
 `reasoning` field and, at its recommended temperature, failed to close within
 3,072 tokens on 4 of 6 closed-book questions in Phase 4. At its 16,384-token
