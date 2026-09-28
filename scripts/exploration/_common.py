@@ -354,7 +354,6 @@ def params_snapshot(model: ModelConfig, **overrides: Any) -> dict[str, Any]:
     snapshot = {
         "temperature": model.temperature,
         "top_p": model.top_p,
-        "seed": model.seed,
         "max_new_tokens": model.max_new_tokens,
         "answer_recovery_max_tokens": model.answer_recovery_max_tokens,
     }
@@ -388,7 +387,6 @@ def result_row(
     return {
         "condition_id": condition_id,
         "tag": tag,
-        "seed": (overrides or {}).get("seed", model.seed),
         "question_id": question.id,
         "split": split,
         "question": question.question,
@@ -482,9 +480,9 @@ def summarize(rows: Sequence[dict[str, Any]], *, tag: str | None = "main") -> st
     is that the numbers a phase's decisions rest on get read at the terminal,
     not only discovered later by whoever re-parses JSONL.
 
-    Filtered to one `tag` by default because the seed check deliberately repeats
-    questions: folding those repeats in would quietly double-count accuracy.
-    Pass `tag=None` for every row.
+    Filtered to one `tag` by default because a caps check deliberately repeats
+    questions under a different `max_new_tokens`: folding those repeats in would
+    quietly double-count accuracy. Pass `tag=None` for every row.
     """
     if tag is not None:
         rows = [row for row in rows if row.get("tag") == tag]

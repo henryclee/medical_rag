@@ -22,7 +22,6 @@ class ModelConfig(BaseModel):
     max_new_tokens: int
     temperature: float
     top_p: float
-    seed: int
     timeout: float = 120.0  # added in Phase 4: per-request HTTP timeout for LLMClient
     max_retries: int = 4    # added in Phase 4: openai-SDK transport retries (429/5xx/connection)
 
@@ -48,7 +47,6 @@ class ConditionConfig(BaseModel):
     retrieval: bool
     reformulation: bool
     verification: bool
-    seeds: list[int]
     params: dict[str, Any] = {}   # free-form lever parameters discovered useful
                                    # during exploration (e.g. {"reranking": true}),
                                    # so a new lever never needs its own typed field
@@ -233,15 +231,17 @@ class LLMClient:
         self,
         prompt: str,
         *,
-        seed: int | None = None,
         max_new_tokens: int | None = None,
         temperature: float | None = None,
         top_p: float | None = None,
         system_prompt: str | None = SYSTEM_PROMPT,   # pass None to send no system turn
     ) -> str
         # Per-call kwargs override the ModelConfig defaults (note: 0.0 is a real
-        # value, not "unset"). Sends max_completion_tokens, temperature, top_p, seed.
-        # Every call logs the full prompt, full response, model name, seed, and a
+        # value, not "unset"). Sends max_completion_tokens, temperature, top_p.
+        # `seed` is deliberately not a parameter: measured inert on this endpoint
+        # (experiments/phase5/FINDINGS.md), and passing it disabled server-side
+        # batching, so it is never sent (see PLAN.md open question 10).
+        # Every call logs the full prompt, full response, model name, and a
         # timestamp (DEBUG carries prompt/response text, INFO carries a one-line
         # summary with finish_reason, elapsed, and token counts), per the
         # "log everything" requirement in the original spec.
@@ -254,7 +254,6 @@ class LLMClient:
         prompt: str,
         output_type: type[ModelT],
         *,
-        seed: int | None = None,
         max_new_tokens: int | None = None,
         temperature: float | None = None,
         top_p: float | None = None,
@@ -307,8 +306,8 @@ def build_reformulation_prompt(question: str) -> str
 def build_verification_prompt(question: str, chunks: list[RetrievedChunk]) -> str
     # Batched: all candidate chunks go into ONE prompt (one LLM call per
     # question, not one per chunk) -- see Phase 2 design-review note in
-    # section 6 on cost/latency at the scale of many conditions x seeds x
-    # questions. Each block prints its chunk_id verbatim so the Verifier can
+    # section 6 on cost/latency at the scale of many conditions x questions.
+    # Each block prints its chunk_id verbatim so the Verifier can
     # join verdicts back without fuzzy matching; demands
     # {"verdicts": [{"chunk_id", "keep", "reason"}]} JSON.
 
@@ -396,7 +395,6 @@ def build_pipeline(condition: ConditionConfig, components: dict[str, Any]) -> Pi
 ```python
 class QuestionResult(BaseModel):
     condition_id: str
-    seed: int
     question_id: str
     question: str
     reformulated_query: str | None
@@ -414,10 +412,12 @@ class ExperimentRunner:
     async def run_condition(
         self, condition: ConditionConfig, dataset: list[MedQAQuestion]
     ) -> list[QuestionResult]
-        # Writes outputs/runs/{condition.id}/seed_{seed}.jsonl incrementally, one
-        # line per question, per seed. Resumable: on start, reads any existing
-        # file for (condition, seed) and skips question_ids already present
-        # (exact resume-manifest format: open question, see section 6).
+        # Writes outputs/runs/{condition.id}/results.jsonl incrementally, one
+        # line per question (one completion per question per condition --
+        # PLAN.md open question 10 dropped the repeated-seed-draws design).
+        # Resumable: on start, reads any existing file for `condition` and
+        # skips question_ids already present (exact resume-manifest format:
+        # open question, see section 6).
 
     async def run_all(
         self, conditions: list[ConditionConfig], dataset: list[MedQAQuestion]

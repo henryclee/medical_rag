@@ -61,7 +61,6 @@ def _model(**overrides) -> ModelConfig:
         "max_new_tokens": 1024,
         "temperature": 0.0,
         "top_p": 1.0,
-        "seed": 123,
     }
     fields.update(overrides)
     return ModelConfig(**fields)
@@ -146,14 +145,14 @@ def test_run_writer_resumes_from_rows_it_flushed(common, tmp_path):
     writer = common.RunWriter("phase5", root=tmp_path)
     assert writer.completed_keys() == set()
     writer.write_row({"model": "model_a", "question_id": "3", "tag": "main"})
-    writer.write_row({"model": "model_b", "question_id": "3", "tag": "seed-same-1"})
+    writer.write_row({"model": "model_b", "question_id": "3", "tag": "cap4096"})
     writer.close()
 
     resumed = common.RunWriter("phase5", run_dir=writer.dir)
     assert resumed.dir == writer.dir
     assert resumed.completed_keys() == {
         ("model_a", "3", "main"),
-        ("model_b", "3", "seed-same-1"),
+        ("model_b", "3", "cap4096"),
     }
     assert len(resumed.load_rows()) == 2
     resumed.close()
@@ -233,19 +232,18 @@ def test_row_carries_its_own_params_and_the_endpoint_it_hit(common):
     assert row["split"] == "dev" and row["question_id"] == "4"
     assert row["params"]["max_new_tokens"] == 512  # the override, not models.yaml's
     assert row["params"]["temperature"] == 0.0
-    assert row["seed"] == 123
     assert row["endpoint"] == "http://127.0.0.1:8081/v1"
     assert row["api_model"] == "Some-Served-Model"
     assert row["tok_s"] == 25.0  # 50 tokens / 2.0 s
     assert row["prompt_chars"] == len("a closed-book prompt")
 
 
-def test_summarize_excludes_the_seed_repeats_by_default(common):
-    """Seed-check rows repeat questions; folding them in would double-count."""
+def test_summarize_excludes_other_tags_by_default(common):
+    """A caps-check row repeats a question under a different tag; folding it in would double-count."""
     rows = [
         _row(common),
         _row(common, question=_question(2, "B"), content="ANSWER: B"),
-        _row(common, tag="seed-same-1", question=_question(1, "A"), content="ANSWER: C"),
+        _row(common, tag="cap4096", question=_question(1, "A"), content="ANSWER: C"),
     ]
     assert "n=2  correct=2 (100%)" in common.summarize(rows)
     assert "n=3" in common.summarize(rows, tag=None)

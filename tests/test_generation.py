@@ -147,7 +147,6 @@ def _config(**overrides) -> ModelConfig:
         "max_new_tokens": 512,
         "temperature": 0.7,
         "top_p": 0.9,
-        "seed": 0,
     }
     payload.update(overrides)
     return ModelConfig(**payload)
@@ -239,7 +238,7 @@ async def test_agenerate_sends_config_defaults_and_credentials(api_key):
     assert body["max_completion_tokens"] == 512
     assert body["temperature"] == 0.7
     assert body["top_p"] == 0.9
-    assert body["seed"] == 0
+    assert "seed" not in body
     assert [message["role"] for message in body["messages"]] == ["system", "user"]
     assert body["messages"][-1]["content"] == "Question?"
 
@@ -252,10 +251,9 @@ async def test_per_call_kwargs_override_config_values(api_key):
         return httpx.Response(200, json=_completion())
 
     async with _client(handler) as client:
-        await client.agenerate("Question?", seed=7, max_new_tokens=64, temperature=0.0, top_p=0.5)
+        await client.agenerate("Question?", max_new_tokens=64, temperature=0.0, top_p=0.5)
 
     body = seen["body"]
-    assert body["seed"] == 7
     assert body["max_completion_tokens"] == 64
     assert body["temperature"] == 0.0  # 0.0 must not read as "use the config value"
     assert body["top_p"] == 0.5
@@ -506,7 +504,7 @@ async def test_live_endpoint_answers_a_medqa_style_question(model_key):
     )
 
     async with LLMClient(model) as client:
-        result = await client.agenerate(prompt, seed=model.seed)
+        result = await client.agenerate(prompt)
 
     # model_b thinks in a `reasoning` field and can spend its whole budget doing
     # it, so require that *something* came back, and score only `content`.

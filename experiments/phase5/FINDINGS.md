@@ -287,7 +287,21 @@ If the fix changes `model_b`'s sampling params, prefer a **fresh** run dir over
 `--resume` so the old looping rows don't sit in the same `results.jsonl` as the
 fixed ones — and re-note in this file which run dir is the one Phase 10 cites.
 Either way, then: flip this file's status banner to "complete", fill `model_b`'s
-row in §2, and mark items 8/10/13 settled.
+row in §2, and mark items 8/13 settled (item 10 is settled below, without
+`model_b`).
+
+## Resolution (2026-09-27) — `seed` removed from the pipeline
+
+This file's `model_a` seed-check result (§3/§5: 5 byte-identical draws across
+`seed=0/100/101`) settled that `seed` is inert on that endpoint. Rather than
+chase the same measurement on `model_b` — whose endpoint died before its half
+of the seed check ran, and non-termination (item 13) would confound the result
+anyway — the project dropped the repeated-seed-draws design outright: `seed`
+is no longer a field on `ModelConfig`, `ConditionConfig`, `LLMClient`, or
+`QuestionResult`, and the experiment now runs one completion per question per
+condition instead of three per seed (see `PLAN.md`, open question 10). The
+`main` findings above and this file's raw artifacts are unaffected and remain
+the historical record; only the seed-check follow-up work is now moot.
 
 
 

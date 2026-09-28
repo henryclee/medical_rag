@@ -10,7 +10,7 @@ recovery path, but its four hand-written questions are not a substitute for real
 MedQA items: they cannot show how a *reasoning* model behaves across a sample,
 which is what the `max_new_tokens` budget has to be sized against.
 
-Four questions this run has to answer (PLAN.md Phase 5):
+Three questions this run has to answer (PLAN.md Phase 5):
 
 1. Does every response parse to a valid option letter via `parse_answer()` on
    real items? Accuracy is reported too, but n=20 is plumbing evidence, never an
@@ -19,19 +19,17 @@ Four questions this run has to answer (PLAN.md Phase 5):
    recovery close it, at the *configured* budgets (`model_a` 1,024 / `model_b`
    16,384)? Those counts -- not guesswork -- decide whether `model_a`'s budget is
    large enough and whether `model_b`'s can come down (open question 8).
-3. Does `seed` actually bite (open question 10)? Phase 4 proved the parameter is
-   *accepted*; if repeated seeds produce identical draws, the study's 3-seed
-   design contributes zero variance and every CI built on it is fiction.
-   `--checks seed` runs the same prompt at the same seed twice and at two
-   different seeds, at each model's own temperature > 0.
-4. Which option letters does each model's *errors* land on? A model biased
+3. Which option letters does each model's *errors* land on? A model biased
    toward one letter confounds every delta in the study.
 
-Requests are sequential within a model by default. Passing `seed` disables
-batched serving in `mlx_lm.server` (experiments/phase4/FINDINGS.md), and both
-endpoints share one Apple Silicon GPU, so `--concurrent-models` would trade the
-per-model tok/s that Phase 13's wall-clock estimate depends on for a shorter
-wall clock here. The concurrency sweep belongs to Phase 9 (open question 12).
+(Open question 10 -- whether `seed` actually bites -- was settled by an earlier
+run of this script and is now resolved by removing `seed` from the pipeline
+entirely: PLAN.md item 10. There is no longer a seed check here.)
+
+Requests are sequential within a model by default. Both endpoints share one
+Apple Silicon GPU, so `--concurrent-models` would trade the per-model tok/s
+that Phase 13's wall-clock estimate depends on for a shorter wall clock here.
+The concurrency sweep belongs to Phase 9 (open question 12).
 
 Cost warning: `model_b` writes a chain of thought into a non-standard
 `reasoning` field and, at its recommended temperature, failed to close within
@@ -71,17 +69,6 @@ from _common import (
 PHASE = "phase5"
 CONDITION_ID = "phase5_closed_book"
 
-# The seed check's four draws per question. Same-seed repeats answer "is the
-# draw reproducible?"; different-seed draws answer "does the seed contribute
-# variance?" -- the 3-seed design needs both, and they are separate questions,
-# so they are measured separately.
-SEED_LABELS: tuple[tuple[str, int], ...] = (
-    ("seed-same-1", 0),
-    ("seed-same-2", 0),
-    ("seed-diff-1", 100),
-    ("seed-diff-2", 101),
-)
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -99,20 +86,11 @@ def parse_args() -> argparse.Namespace:
         help="pins which questions are drawn; recorded in context.md",
     )
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="generation seed for the main pass (default: each model's own seed)",
-    )
-    parser.add_argument(
         "--checks",
         nargs="*",
-        choices=("main", "seed", "caps"),
-        default=["main", "seed"],
+        choices=("main", "caps"),
+        default=["main"],
         help="which checks to run",
-    )
-    parser.add_argument(
-        "--seed-questions", type=int, default=2, help="questions to repeat for the seed check"
     )
     parser.add_argument(
         "--caps",
@@ -176,7 +154,7 @@ def chain_header(row: dict[str, Any]) -> str:
     """The one-line provenance stamped atop every saved chain of thought."""
     return (
         f"# {row['model']} q{row['question_id']} [{row['tag']}] "
-        f"seed={row['seed']} max_new_tokens={row['params']['max_new_tokens']}\n"
+        f"max_new_tokens={row['params']['max_new_tokens']}\n"
         f"gold={row['correct_answer']} answer={row['parsed_answer']} "
         f"finish={row['finish_reason']} completion_tokens={row['completion_tokens']} "
         f"wall_s={row['wall_s']} prompt_chars={row['prompt_chars']} "
@@ -188,7 +166,6 @@ async def run_main_check(
     model: ModelConfig,
     client: LLMClient,
     questions: list[MedQAQuestion],
-    seed: int | None,
     split: str,
     writer: RunWriter,
     done: set[tuple[str, str, str]],
@@ -200,7 +177,6 @@ async def run_main_check(
     a resumed run reports the whole run rather than just this session's slice.
     """
     problems: list[str] = []
-    overrides = {} if seed is None else {"seed": seed}
 
     for index, question in enumerate(questions, start=1):
         if (model.name, question.id, "main") in done:
@@ -210,7 +186,7 @@ async def run_main_check(
         prompt = build_answer_prompt(question.question, question.options, None)
         started = time.perf_counter()
         try:
-            result = await client.agenerate(prompt, seed=seed)
+            result = await client.agenerate(prompt)
         except LLMError as exc:
             writer.write_row(
                 error_row(
@@ -235,7 +211,6 @@ async def run_main_check(
                 split=split,
                 prompt=prompt,
                 result=result,
-                overrides=overrides,
             )
         )
         writer.write_chain(
@@ -270,180 +245,10 @@ async def run_main_check(
     return problems
 
 
-def _tally(flags: list[bool]) -> str:
-    return "n/a" if not flags else f"{sum(flags)}/{len(flags)}"
-
-
-VERDICT_NOTES = {
-    "bites": "seed contributes variance, so the 3-seed design is honest.",
-    "inert": "every draw was identical regardless of seed, so repeated seeds buy zero "
-    "variance -- report seed variance as unsupported by this endpoint, or drive "
-    "repetition from temperature instead (open question 10).",
-    "nondeterministic-with-fixed-seed": "the endpoint does not pin the draw at a fixed "
-    "seed, so no reproducibility claim survives: rerunning the pilot would not "
-    "reproduce the pilot.",
-    "partial": "mixed signals -- the sample is too small to settle it; raise "
-    "--seed-questions before the Phase 10 freeze.",
-    "inconclusive": "no question completed all four draws; nothing was measured.",
-}
-
-
-def seed_verdict(
-    model_name: str,
-    draws: dict[str, dict[str, str]],
-    letters: dict[str, dict[str, str | None]],
-    temperature: float,
-) -> tuple[str, str]:
-    """Interpret the same-seed vs different-seed comparison.
-
-    Compares the graded `content`, not the reasoning text: identical content on a
-    reasoning model is strong evidence the whole draw was identical, and content
-    is what scoring reads, so this is the determinism claim that matters.
-    Returns `(verdict, report)`; the verdict string is what FINDINGS.md cites.
-    """
-    labels = [label for label, _ in SEED_LABELS]
-    complete = [qid for qid in draws if all(label in draws[qid] for label in labels)]
-
-    same = [draws[q][labels[0]] == draws[q][labels[1]] for q in complete]
-    diff = [draws[q][labels[2]] == draws[q][labels[3]] for q in complete]
-    cross = [draws[q][labels[0]] == draws[q][labels[2]] for q in complete]
-    same_letter = [
-        letters[q].get(labels[0]) is not None
-        and letters[q][labels[0]] == letters[q][labels[1]]
-        for q in complete
-    ]
-    diff_letter = [
-        letters[q].get(labels[2]) is not None
-        and letters[q][labels[2]] == letters[q][labels[3]]
-        for q in complete
-    ]
-
-    if not complete:
-        verdict = "inconclusive"
-    elif not all(same):
-        verdict = "nondeterministic-with-fixed-seed"
-    elif all(cross):
-        verdict = "inert"
-    elif all(diff) and not any(cross):
-        verdict = "bites"
-    else:
-        verdict = "partial"
-
-    report = [
-        f"seed check ({model_name}, temperature={temperature}, "
-        f"{len(complete)} question(s) x {len(labels)} draws)",
-        f"  same-seed pair identical:          {_tally(same)}",
-        f"  different-seed pair identical:     {_tally(diff)}",
-        f"  same- vs different-seed identical: {_tally(cross)}",
-        f"  letter agrees, same seed:          {_tally(same_letter)}",
-        f"  letter agrees, different seeds:    {_tally(diff_letter)}",
-        f"  VERDICT: {verdict} -- {VERDICT_NOTES[verdict]}",
-    ]
-    if len(complete) < len(draws):
-        report.append(
-            f"  note: {len(draws) - len(complete)} question(s) lacked a full set of "
-            f"{len(labels)} draws (errors or an unfinished resume) and were excluded"
-        )
-    return verdict, "\n".join(report)
-
-
-async def run_seed_check(
-    model: ModelConfig,
-    client: LLMClient,
-    questions: list[MedQAQuestion],
-    seed: int | None,
-    split: str,
-    writer: RunWriter,
-    done: set[tuple[str, str, str]],
-) -> tuple[list[str], list[str]]:
-    """Does `seed` bite? Open question 10, which decides the whole variance design.
-
-    Phase 4 only proved the parameter is *accepted* -- a 200 after adding
-    `seed=123` to a temperature-0 call. Under a 3-seed design that distinction
-    is fatal: if the endpoint ignores the seed, or ignores sampling altogether,
-    the repetitions contribute no variance and every interval built on them is
-    fiction. Four draws per question separate the two failure modes.
-
-    Returns `(problems, report_lines)`; the report is what lands in
-    `seed_check.md` and in FINDINGS.md.
-    """
-    base_seed = seed if seed is not None else model.seed
-
-    problems: list[str] = []
-    draws: dict[str, dict[str, str]] = {}
-    letters: dict[str, dict[str, str | None]] = {}
-    wanted = dict(SEED_LABELS)
-    prior = {
-        (row["question_id"], row["tag"]): row
-        for row in writer.load_rows()
-        if row.get("model") == model.name and row.get("tag") in wanted
-    }
-
-    for question in questions:
-        prompt = build_answer_prompt(question.question, question.options, None)
-        for label, offset in SEED_LABELS:
-            draws.setdefault(question.id, {})
-            letters.setdefault(question.id, {})
-            seed_value = base_seed + offset
-
-            if (model.name, question.id, label) in done:
-                row = prior.get((question.id, label))
-                if row is not None:
-                    draws[question.id][label] = row.get("raw_model_output") or ""
-                    letters[question.id][label] = row.get("parsed_answer")
-                    logger.info(
-                        "{}/{} {} already logged -- reusing (resume)",
-                        model.name,
-                        question.id,
-                        label,
-                    )
-                    continue
-
-            try:
-                result = await client.agenerate(prompt, seed=seed_value)
-            except LLMError as exc:
-                problems.append(f"{model.name}/q{question.id}[{label}]: {exc}")
-                continue
-            row = writer.write_row(
-                result_row(
-                    model=model,
-                    question=question,
-                    tag=label,
-                    condition_id=f"{CONDITION_ID}_seed",
-                    split=split,
-                    prompt=prompt,
-                    result=result,
-                    overrides={"seed": seed_value},
-                )
-            )
-            writer.write_chain(
-                model,
-                f"{question.id}.{label}",
-                chain_header(row),
-                result.reasoning or result.content,
-            )
-            draws[question.id][label] = result.content
-            letters[question.id][label] = row["parsed_answer"]
-            logger.info(
-                "seed-check q{} {} seed={} -> {} ({} content / {} reasoning chars, {:.1f}s)",
-                question.id,
-                label,
-                seed_value,
-                row["parsed_answer"],
-                row["content_chars"],
-                row["reasoning_chars"],
-                row["wall_s"],
-            )
-
-    _, report = seed_verdict(model.name, draws, letters, model.temperature)
-    return problems, report.splitlines()
-
-
 async def run_caps_check(
     model: ModelConfig,
     client: LLMClient,
     questions: list[MedQAQuestion],
-    seed: int | None,
     cap: int,
     split: str,
     writer: RunWriter,
@@ -467,7 +272,7 @@ async def run_caps_check(
         prompt = build_answer_prompt(question.question, question.options, None)
         started = time.perf_counter()
         try:
-            result = await client.agenerate(prompt, seed=seed, max_new_tokens=cap)
+            result = await client.agenerate(prompt, max_new_tokens=cap)
         except LLMError as exc:
             writer.write_row(
                 error_row(
@@ -492,7 +297,7 @@ async def run_caps_check(
                 split=split,
                 prompt=prompt,
                 result=result,
-                overrides=({"seed": seed} if seed is not None else {}) | {"max_new_tokens": cap},
+                overrides={"max_new_tokens": cap},
             )
         )
         writer.write_chain(model, f"{question.id}.{tag}", chain_header(row), result.reasoning or result.content)
@@ -514,15 +319,13 @@ TPS_PESSIMISTIC = 40.0
 TPS_OPTIMISTIC = 80.0
 
 
-def planned_calls(args: argparse.Namespace, n_sample: int, n_repeated: int, n_models: int) -> dict:
+def planned_calls(args: argparse.Namespace, n_sample: int, n_cap_questions: int, n_models: int) -> dict:
     """How many completions each check will fire, so cost is visible up front."""
     plan = {}
     if "main" in args.checks:
         plan["main"] = n_sample * n_models
-    if "seed" in args.checks:
-        plan["seed"] = n_repeated * len(SEED_LABELS) * n_models
     if args.caps:
-        plan["caps"] = len(args.caps) * n_repeated * n_models
+        plan["caps"] = len(args.caps) * n_cap_questions * n_models
     return plan
 
 
@@ -544,8 +347,7 @@ def print_plan(
         model = config.models[key]
         print(
             f"  {key}: {model.api_model_name} @ {model.base_url} temperature={model.temperature} "
-            f"max_new_tokens={model.max_new_tokens} recovery={model.answer_recovery_max_tokens} "
-            f"seed={model.seed}"
+            f"max_new_tokens={model.max_new_tokens} recovery={model.answer_recovery_max_tokens}"
         )
     print()
     print(f"planned completions: {plan} (total {sum(plan.values())})")
@@ -573,7 +375,6 @@ async def amain(args: argparse.Namespace) -> int:
     questions = load_medqa(config.dev_split)
     sample = select_sample(questions, args.sample_size, args.sample_seed)
     gold = warn_on_degenerate_sample(sample)
-    repeated = sample[: max(0, args.seed_questions)]
     cap_questions = sample[: max(0, args.cap_questions)]
 
     print_plan(
@@ -582,13 +383,12 @@ async def amain(args: argparse.Namespace) -> int:
         keys,
         sample,
         gold,
-        planned_calls(args, len(sample), len(repeated), len(keys)),
+        planned_calls(args, len(sample), len(cap_questions), len(keys)),
     )
     if args.dry_run:
         print("\ndry run -- no requests sent")
         return 0
 
-    reports: list[str] = []
     with RunWriter(
         PHASE, root=args.out_root, run_dir=args.resume, save_chains=not args.no_chains
     ) as writer:
@@ -603,14 +403,8 @@ async def amain(args: argparse.Namespace) -> int:
             sample_seed=args.sample_seed,
             extra={
                 "checks": ", ".join(args.checks),
-                "seed-check questions": (
-                    ",".join(question.id for question in repeated)
-                    if "seed" in args.checks
-                    else "n/a (seed check not requested)"
-                ),
                 "caps": args.caps or "none",
                 "concurrent_models": args.concurrent_models,
-                "seed report": "seed_check.md, written after the run",
                 "scoring note": "parsed_answer is recomputed against each question's own "
                 "option letters, not GenerationResult.parsed_answer's hardcoded ABCDE",
             },
@@ -634,23 +428,13 @@ async def amain(args: argparse.Namespace) -> int:
 
                 if "main" in args.checks:
                     problems += await run_main_check(
-                        model, client, sample, args.seed, config.dev_split, writer, done
+                        model, client, sample, config.dev_split, writer, done
                     )
-                if "seed" in args.checks:
-                    seed_problems, report = await run_seed_check(
-                        model, client, repeated, args.seed, config.dev_split, writer, done
-                    )
-                    problems += seed_problems
-                    if report:
-                        # extend, not +=: rebinding `reports` here would need
-                        # nonlocal and would silently drop the other arm's report.
-                        reports.extend([f"## {model.name}", *report, ""])
                 for cap in args.caps or []:
                     problems += await run_caps_check(
                         model,
                         client,
                         cap_questions,
-                        args.seed,
                         cap,
                         config.dev_split,
                         writer,
@@ -668,14 +452,8 @@ async def amain(args: argparse.Namespace) -> int:
         for key in keys:
             if not any(row.get("model") == config.models[key].name for row in rows):
                 problems.append(f"{key}: produced no rows at all")
-        if reports:
-            (writer.dir / "seed_check.md").write_text(
-                "# Seed check -- open question 10\n\n" + "\n".join(reports) + "\n", encoding="utf-8"
-            )
 
     print("\n" + summarize(rows))
-    if reports:
-        print("\n" + "\n".join(reports))
     print(f"\nartifacts: {writer.dir}")
 
     if problems:

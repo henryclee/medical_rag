@@ -24,7 +24,6 @@ class ModelConfig(BaseModel):
     max_new_tokens: int
     temperature: float
     top_p: float
-    seed: int
     # HTTP transport policy for LLMClient; defaulted so existing configs need no
     # change and so the retry/timeout rule lives in config rather than in code.
     timeout: float = 120.0
@@ -64,7 +63,6 @@ class ConditionConfig(BaseModel):
     retrieval: bool
     reformulation: bool
     verification: bool
-    seeds: list[int]
     # Free-form lever parameters discovered useful during exploration (e.g.
     # {"reranking": true}), so a new exploratory lever never needs its own
     # typed field.

@@ -31,7 +31,6 @@ def test_load_config_rejects_undefined_model(tmp_path):
         "    max_new_tokens: 10\n"
         "    temperature: 0.0\n"
         "    top_p: 1.0\n"
-        "    seed: 0\n"
     )
     (tmp_path / "conditions.yaml").write_text(
         "conditions:\n"
@@ -41,7 +40,6 @@ def test_load_config_rejects_undefined_model(tmp_path):
         "    retrieval: false\n"
         "    reformulation: false\n"
         "    verification: false\n"
-        "    seeds: [0]\n"
     )
     (tmp_path / "default.yaml").write_text(
         "benchmark: x\n"

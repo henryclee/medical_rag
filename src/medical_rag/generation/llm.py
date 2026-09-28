@@ -149,14 +149,12 @@ class LLMClient:
 
     def _resolve_params(
         self,
-        seed: int | None,
         max_new_tokens: int | None,
         temperature: float | None,
         top_p: float | None,
     ) -> dict:
         config = self.config
         return {
-            "seed": config.seed if seed is None else seed,
             "max_new_tokens": config.max_new_tokens if max_new_tokens is None else max_new_tokens,
             "temperature": config.temperature if temperature is None else temperature,
             "top_p": config.top_p if top_p is None else top_p,
@@ -166,7 +164,6 @@ class LLMClient:
         self,
         prompt: str,
         *,
-        seed: int | None = None,
         max_new_tokens: int | None = None,
         temperature: float | None = None,
         top_p: float | None = None,
@@ -180,7 +177,7 @@ class LLMClient:
         record the row and score it as unanswered rather than losing it.
         """
         config = self.config
-        params = self._resolve_params(seed, max_new_tokens, temperature, top_p)
+        params = self._resolve_params(max_new_tokens, temperature, top_p)
 
         messages: list[dict] = []
         if system_prompt:
@@ -188,17 +185,16 @@ class LLMClient:
         messages.append({"role": "user", "content": prompt})
 
         stamp = datetime.now(timezone.utc).isoformat()
-        logger.bind(kind="llm_request", model=config.name, seed=params["seed"], timestamp=stamp).debug(
+        logger.bind(kind="llm_request", model=config.name, timestamp=stamp).debug(
             "prompt: {}", prompt
         )
 
         result = await self._complete(messages, **params)
 
-        logger.bind(kind="llm_summary", model=config.name, seed=params["seed"], timestamp=stamp).info(
-            "llm call model={} seed={} finish_reason={} elapsed={:.2f}s "
+        logger.bind(kind="llm_summary", model=config.name, timestamp=stamp).info(
+            "llm call model={} finish_reason={} elapsed={:.2f}s "
             "prompt_tokens={} completion_tokens={} response_chars={} reasoning_chars={}",
             config.name,
-            params["seed"],
             result.finish_reason,
             result.elapsed_s,
             result.prompt_tokens,
@@ -206,12 +202,12 @@ class LLMClient:
             len(result.content),
             len(result.reasoning),
         )
-        logger.bind(kind="llm_response", model=config.name, seed=params["seed"], timestamp=stamp).debug(
+        logger.bind(kind="llm_response", model=config.name, timestamp=stamp).debug(
             "response: {}", result.content
         )
         if result.reasoning:
             logger.bind(
-                kind="llm_reasoning", model=config.name, seed=params["seed"], timestamp=stamp
+                kind="llm_reasoning", model=config.name, timestamp=stamp
             ).debug("chain of thought: {}", result.reasoning)
 
         if result.truncated:
@@ -250,7 +246,6 @@ class LLMClient:
         max_new_tokens: int,
         temperature: float,
         top_p: float,
-        seed: int,
     ) -> GenerationResult:
         """Send one chat completion, splitting answer text from chain of thought."""
         config = self.config
@@ -262,7 +257,6 @@ class LLMClient:
                 max_completion_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
-                seed=seed,
             )
         except openai.AuthenticationError as exc:
             raise LLMError(
@@ -329,7 +323,6 @@ class LLMClient:
             max_new_tokens=config.answer_recovery_max_tokens,
             temperature=params["temperature"],
             top_p=params["top_p"],
-            seed=params["seed"],
         )
 
         result.recovery_attempted = True
@@ -357,7 +350,6 @@ class LLMClient:
         prompt: str,
         output_type: type[ModelT],
         *,
-        seed: int | None = None,
         max_new_tokens: int | None = None,
         temperature: float | None = None,
         top_p: float | None = None,
@@ -365,7 +357,7 @@ class LLMClient:
     ) -> ModelT:
         """Generate once and validate the response against `output_type`."""
         config = self.config
-        params = self._resolve_params(seed, max_new_tokens, temperature, top_p)
+        params = self._resolve_params(max_new_tokens, temperature, top_p)
 
         logger.bind(kind="llm_request", model=config.name, structured=True).debug(
             "structured prompt ({}): {}", output_type.__name__, prompt
@@ -386,7 +378,6 @@ class LLMClient:
                 max_tokens=params["max_new_tokens"],
                 temperature=params["temperature"],
                 top_p=params["top_p"],
-                seed=params["seed"],
                 timeout=config.timeout,
             ),
         )

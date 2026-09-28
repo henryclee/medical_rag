@@ -13,8 +13,8 @@ Two checks:
   recovery   forces the chain of thought to exhaust `max_new_tokens`, then
              confirms the one-shot recovery call closes with a parsable answer.
 
-Requests are deliberately sequential: `mlx_lm.server` disables batched serving
-when a seed is sent, and concurrency would distort the timing measured here.
+Requests are deliberately sequential: concurrency would distort the per-request
+timing measured here.
 
 Requires the endpoints named in config/models.yaml to be running and their API
 keys exported (`set -a && source .env && set +a`).
@@ -177,7 +177,6 @@ def _emit(row: dict) -> dict:
 async def run_latency_check(
     model: ModelConfig,
     client: LLMClient,
-    seed: int | None,
     chains_dir: Path | None,
 ) -> tuple[list[dict], list[str]]:
     """Closed-book cost/latency over the probe set, at the model's own budget."""
@@ -187,7 +186,7 @@ async def run_latency_check(
         prompt = build_answer_prompt(question, options, None)
         started = time.perf_counter()
         try:
-            result = await client.agenerate(prompt, seed=seed)
+            result = await client.agenerate(prompt)
         except LLMError as exc:
             rows.append(_emit(_error_row(model, qid, exc, time.perf_counter() - started)))
             problems.append(f"{model.name}/{qid}: {exc}")
@@ -211,7 +210,6 @@ async def run_latency_check(
 async def run_recovery_check(
     model: ModelConfig,
     client: LLMClient,
-    seed: int | None,
     caps: list[int],
     chains_dir: Path | None,
 ) -> tuple[list[dict], list[str]]:
@@ -226,7 +224,7 @@ async def run_recovery_check(
         tag = f"recovery-cap{cap}"
         started = time.perf_counter()
         try:
-            result = await client.agenerate(prompt, seed=seed, max_new_tokens=cap)
+            result = await client.agenerate(prompt, max_new_tokens=cap)
         except LLMError as exc:
             rows.append(_emit(_error_row(model, tag, exc, time.perf_counter() - started)))
             problems.append(f"{model.name}/{tag}: {exc}")
@@ -294,7 +292,6 @@ def parse_args() -> argparse.Namespace:
         default=("latency", "recovery"),
         help="which checks to run",
     )
-    parser.add_argument("--seed", type=int, default=None, help="default: each model's own seed")
     parser.add_argument(
         "--caps",
         nargs="*",
@@ -337,10 +334,10 @@ async def amain(args: argparse.Namespace) -> int:
         async with client:
             rows, row_problems = ([], [])
             if "latency" in args.checks:
-                rows, row_problems = await run_latency_check(model, client, args.seed, chains_dir)
+                rows, row_problems = await run_latency_check(model, client, chains_dir)
             if "recovery" in args.checks:
                 more_rows, more_problems = await run_recovery_check(
-                    model, client, args.seed, args.caps, chains_dir
+                    model, client, args.caps, chains_dir
                 )
                 rows += more_rows
                 row_problems += more_problems
