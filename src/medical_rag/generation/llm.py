@@ -124,10 +124,16 @@ class LLMClient:
 
         api_key = os.environ.get(config.api_key_env)
         if not api_key:
+            # `config.load_config()` now populates `os.environ` from the repo's
+            # `.env` (see `config.load_env()`), so reaching here means the name
+            # is in neither place. Say that rather than pointing at a file the
+            # caller may not have, and skip the "add it to .env" advice that
+            # this error used to give while nothing read `.env` at all.
             raise LLMError(
                 f"model '{config.name}' reads its API key from environment variable "
-                f"'{config.api_key_env}', which is unset or empty; export it or add it "
-                "to the repo's gitignored .env (see .env.example)"
+                f"'{config.api_key_env}', which is unset or empty in both the process "
+                "environment and the gitignored .env that load_config() searched "
+                "(see .env.example); export it or add it there"
             )
 
         self.client = openai.AsyncOpenAI(

@@ -20,6 +20,10 @@ dependencies = [
     "matplotlib==3.11.2",
     "pyyaml==6.0.3",
     "rank-bm25==0.2.2",
+    # Direct since config.load_env() reads the gitignored .env itself; was
+    # already in requirements.lock.txt (same version) as a pydantic-settings
+    # transitive, so this declares an existing pin rather than adding one.
+    "python-dotenv==1.2.3",
 ]
 
 [project.optional-dependencies]

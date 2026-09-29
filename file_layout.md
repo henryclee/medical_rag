@@ -9,7 +9,7 @@ config/conditions.yaml         Experiment conditions for the current study; prov
 pyproject.toml                 Package metadata, exact-pinned dependencies, pytest config.
 requirements.lock.txt          Full `pip freeze` snapshot of the environment.
 .gitignore                     Excludes .venv/, data/, outputs/, caches, and .env — and deliberately NOT experiments/, which is tracked because exploratory evidence has to be versioned to be reviewable (section 5's artifact convention).
-.env                           Gitignored. Holds MODEL_A_API_KEY / MODEL_B_API_KEY for the served endpoints; `source` it before any endpoint-calling command.
+.env                           Gitignored. Holds MODEL_A_API_KEY / MODEL_B_API_KEY / JUDGE_MODEL_API_KEY for the served endpoints; `config.load_env()` merges it into `os.environ` during `load_config()` (an exported value always wins), so `source` is only needed for raw `curl` checks.
 .env.example                   Template listing those variable names with no secrets.
 README.md                      Overview/Installation/Usage (Usage still a stub).
 PLAN.md                        This file.

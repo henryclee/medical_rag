@@ -64,9 +64,21 @@ class ExperimentConfig(BaseModel):
     # @model_validator(mode="after"): raises ValueError if any ConditionConfig.model
     # is not a key in `models`.
 
-def load_config(path: str | Path = "config/default.yaml") -> ExperimentConfig
+def load_env(config_path: str | Path = "config/default.yaml", *,
+             env_path: str | Path | None = None) -> Path | None
+    # Merges the gitignored .env into os.environ and returns the file read (None if
+    # there is none, which is not an error). Searches cwd and its ancestors, then
+    # the repo root `config_path` implies. Fill-only: never overwrites an exported
+    # variable, never exports an empty value (so LLMError still fires), never
+    # expands `$` inside a key, and never logs values -- names only.
+
+def load_config(path: str | Path = "config/default.yaml", *,
+                env_path: str | Path | None = None,
+                load_env_file: bool = True) -> ExperimentConfig
     # Reads default.yaml, models.yaml, conditions.yaml from the same directory as
     # `path`, shallow-merges their top-level keys, and validates the result.
+    # Calls load_env() first (unless load_env_file=False), so an api_key_env whose
+    # value lives only in .env is populated before any LLMClient reads it.
 ```
 
 ### `medical_rag.data.load_medqa` ✅
@@ -225,7 +237,8 @@ class LLMClient:
         *,
         http_client: httpx.AsyncClient | None = None,   # test seam: pass an httpx.MockTransport client
     ) -> None
-        # Raises LLMError naming config.api_key_env (and .env) if that variable is unset.
+        # Raises LLMError naming config.api_key_env when neither os.environ nor the
+        # .env that config.load_env() merged supplies it.
 
     async def agenerate(
         self,

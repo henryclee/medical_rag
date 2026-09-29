@@ -28,6 +28,13 @@ entry names, so they live in a gitignored `.env` at the repo root (copy
 set -a; source .env; set +a     # exports MODEL_A_API_KEY / MODEL_B_API_KEY
 ```
 
+That prefix is now optional for the Python entry points: `load_config()` calls
+`config.load_env()`, which merges the repo root's `.env` into the environment
+before any client reads a key. It only fills gaps, so anything you `export`
+still wins, and an empty `KEY=` in the file stays empty (you get the
+`LLMError`, not a 401). Keep using the prefix for raw `curl` checks, which have
+no config loader.
+
 Then:
 
 ```bash
