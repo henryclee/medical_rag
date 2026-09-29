@@ -75,3 +75,13 @@ models:
     timeout: 300.0
     max_retries: 1
     answer_recovery_max_tokens: 512
+  judge_model:
+    name: judge_model
+    base_url: "http://localhost:8080/v1"
+    api_model_name: "Qwen3.8-Flash-Next-oQ6e-mtp"
+    api_key_env: "JUDGE_MODEL_API_KEY"
+    max_new_tokens: 4096
+    temperature: 1.0
+    top_p: 0.95
+    timeout: 300.0
+    max_retries: 1
