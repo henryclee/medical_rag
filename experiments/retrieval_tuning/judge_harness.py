@@ -12,15 +12,25 @@ for (`supports_options`) -- and gold-option recall is computed
 *programmatically* afterwards. That keeps the label reusable and never
 leaks the answer into the grading prompt.
 
-Six retrieval levers are compared against the same judge cache: dense-only,
-dense+rerank (today's production config), BM25 (new lexical index, see
-`bm25_index.py`), hybrid RRF fusion of dense+BM25 with and without rerank
-(`hybrid.py`), and reformulation-as-retrieval (rewriting the query with the
-already-implemented `build_reformulation_prompt()` before a dense
-retrieval). For each of the pinned 20 questions, every method's candidate
-chunk_ids are unioned and judged with **one** batched structured call to
-`judge_model` -- so comparing six methods costs the same ~20 judge calls as
-comparing one.
+The grid is five strategies -- dense, dense+rerank (today's production config),
+BM25 (see `bm25_index.py`), hybrid RRF fusion of dense+BM25, and hybrid+rerank
+(`hybrid.py`) -- crossed with two query variants: the question text (`__orig`)
+and a reformulated information need (`__reform`), rewritten with
+`build_reformulation_prompt()`. Ten cells, defined once in `strategies.py`, which
+`inspect_retrieval.py` renders cell by cell.
+
+For each pinned question, every cell's candidate chunk_ids are unioned and judged
+once per unseen chunk -- so ten methods cost no more judge time than one.
+Verdicts live in a persistent cache (`judge_cache.py`) keyed
+`(question_id, chunk_id, judge_prompt_sha)`, so a rerun pays only for chunks no
+run has graded before, and the chunk *text* the run surfaced is written to a
+`chunks.jsonl` sidecar so the run can be re-read without loading the index.
+
+The first run of this script (2026-09-29) reported a `reform_dense` method whose
+reformulation fell back to the raw question on 18 of 20 questions; `FINDINGS.md`
+quotes numbers from it that the run never measured. The parsing bug behind that
+is fixed in `reformulate.py`, and `render_findings` now prints an integrity
+section that states how many rows fell back before any Δ can be read.
 
 Side track, not a numbered phase (PLAN.md "Next actions"): production code
 under `src/medical_rag/` is not touched. Follows `scripts/exploration/`'s
@@ -42,16 +52,13 @@ import sys
 from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Sequence
+from typing import Any, Sequence
 
 from loguru import logger
-from pydantic import BaseModel
 
 from medical_rag.config import ExperimentConfig, load_config
 from medical_rag.data.load_medqa import MedQAQuestion, load_medqa
 from medical_rag.generation.llm import LLMClient, LLMError
-from medical_rag.generation.prompt import build_reformulation_prompt, format_options
-from medical_rag.retrieval.retriever import RetrievedChunk, Retriever
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO_ROOT / "scripts" / "exploration"))
@@ -69,7 +76,25 @@ from _common import (  # noqa: E402
 )
 from raw_rag import Preflight, build_retriever, preflight, resolve_index_dir  # noqa: E402
 from bm25_index import DEFAULT_BM25_PATH, load_or_build_bm25_index  # noqa: E402
-from hybrid import rrf_fuse  # noqa: E402
+from chunk_store import append_chunks  # noqa: E402
+from judge_cache import DEFAULT_JUDGE_CACHE, ensure_verdicts, load_cache  # noqa: E402
+from judge_prompt import (  # noqa: E402
+    JUDGE_JSON_INSTRUCTION,
+    JUDGE_SYSTEM_PROMPT,
+    ChunkJudgment,  # noqa: F401 - re-exported: older tooling imports the schema here
+    JudgeVerdict,  # noqa: F401 - ditto
+    build_judge_prompt,  # noqa: F401 - ditto
+    judge_prompt_sha,
+)
+from metrics import aggregate  # noqa: E402
+from reformulate import load_template, reformulate_query  # noqa: E402
+from strategies import (  # noqa: E402
+    BASE_STRATEGIES,
+    METHOD_GRID,
+    QUERY_VARIANTS,
+    aretrieve_grid,
+    canonical_method,
+)
 
 PHASE = "retrieval_tuning"
 CONDITION_ID = "retrieval_tuning_judge"
@@ -83,68 +108,19 @@ SAMPLE_QUESTION_IDS: list[str] = [
     "9597", "10064",
 ]
 
-K_VALUES = (5, 10, 20)
-RELEVANT_LEVELS = {"relevant", "partial"}
+K_VALUES = (5, 10, 20)  # reported k values; `metrics.K_VALUES` holds the same tuple
 
-# One retrieval pass per method; order here is the order FINDINGS.md reports.
-METHOD_NAMES = ("dense", "dense_rerank", "bm25", "hybrid", "hybrid_rerank", "reform_dense")
+# The grid, from `strategies.py`: five strategies x two query variants. This
+# module used to carry its own six-name list with `reform_dense` as a sixth
+# strategy, which is what let a broken reformulation hide as a method -- the ids
+# now come from the one module `inspect_retrieval.py` also uses.
+METHOD_NAMES = METHOD_GRID
 
-
-class ChunkJudgment(BaseModel):
-    chunk_id: str
-    relevance: Literal["relevant", "partial", "irrelevant"]
-    supports_options: list[str]
-    reason: str
-
-
-class JudgeVerdict(BaseModel):
-    judgments: list[ChunkJudgment]
-
-
-_JUDGE_SYSTEM_PROMPT: str = (
-    "You are grading whether retrieved medical reference excerpts help answer "
-    "a USMLE-style multiple-choice question. You are not answering it."
-)
-
-_JUDGE_JSON_INSTRUCTION: str = (
-    "Respond with JSON only, in exactly this shape:\n"
-    '{"judgments": [{"chunk_id": "<the chunk_id shown above>", '
-    '"relevance": "relevant" | "partial" | "irrelevant", '
-    '"supports_options": ["<subset of the option letters above, or []>"], '
-    '"reason": "<one short sentence>"}]}\n'
-    "Include exactly one judgment per chunk_id listed above, using each "
-    'chunk_id verbatim. "relevant" means the excerpt directly helps '
-    'distinguish which option is correct; "partial" means it is topically '
-    'related but does not resolve the question; "irrelevant" means it does '
-    "not help at all. List an option letter in supports_options only if the "
-    "excerpt gives evidence for that specific option -- never guess which "
-    "option is correct if the excerpt does not say."
-)
-
-
-def build_judge_prompt(question: MedQAQuestion, chunks: Sequence[RetrievedChunk]) -> str:
-    """One batched, gold-blind relevance prompt over every candidate chunk.
-
-    The correct answer is never shown -- only the question and its four
-    options -- so `supports_options` is the judge's own read of the evidence,
-    not an echo of what it was told. Gold-option recall is derived later by
-    checking programmatically whether the gold letter is in that set.
-    """
-    numbered = "\n\n".join(
-        f"[{index}] chunk_id={chunk.chunk_id} title={chunk.title}\n{chunk.content}"
-        for index, chunk in enumerate(chunks, start=1)
-    )
-    return "\n\n".join(
-        [
-            "You are grading retrieved reference excerpts for a medical exam "
-            "question. You are NOT told which option is correct -- judge each "
-            "excerpt on its own medical content.\n\n"
-            f"Question: {question.question}",
-            f"Options:\n{format_options(question.options)}",
-            f"Candidate excerpts:\n{numbered}",
-            _JUDGE_JSON_INSTRUCTION,
-        ]
-    )
+# The rubric lives in `judge_prompt.py` so the inspector grades with identical
+# wording (and the verdict cache keys on one `judge_prompt_sha()`); these two
+# aliases exist because older tooling imports the underscore names from here.
+_JUDGE_SYSTEM_PROMPT = JUDGE_SYSTEM_PROMPT
+_JUDGE_JSON_INSTRUCTION = JUDGE_JSON_INSTRUCTION
 
 
 def parse_args() -> argparse.Namespace:
@@ -184,6 +160,34 @@ def parse_args() -> argparse.Namespace:
         "--rerank-k", type=int, default=None,
         help="chunks kept after rerank (default: config.retrieval.top_k_rerank)",
     )
+    parser.add_argument(
+        "--bm25-top-k", type=int, default=None,
+        help="BM25 depth, separate from --top-k (default: --top-k). BM25's low recall is "
+        "the open question; this separates 'too shallow' from 'wrong vocabulary'",
+    )
+    parser.add_argument(
+        "--rerank-with", choices=("question", "reform"), default="question",
+        help="which string the cross-encoder scores. 'question' (default) makes "
+        "orig-vs-reform a single-variable change: only the embedding query differs",
+    )
+    parser.add_argument(
+        "--no-reform", action="store_true",
+        help="drop the reform column -- 5 methods instead of 10, and one LLM call less per question",
+    )
+    parser.add_argument(
+        "--reform-prompt", default=None, metavar="FILE",
+        help="reformulation template with a {question} placeholder, replacing production's "
+        "(see TUNING.md: exploratory prompts never go into src/)",
+    )
+    parser.add_argument(
+        "--judge-cache", default=str(DEFAULT_JUDGE_CACHE),
+        help="append-only verdict cache; read before any judge call and written after",
+    )
+    parser.add_argument(
+        "--judge-batch", type=int, default=24,
+        help="chunks per judge call (the 20-question run used 40 and the model started "
+        "dropping items; a lost batch now costs a re-ask, not a lost run)",
+    )
     parser.add_argument("--output-dir", default=DEFAULT_RUN_ROOT, help="run-artifact root")
     parser.add_argument(
         "--findings-path", default="experiments/retrieval_tuning/FINDINGS.md",
@@ -192,6 +196,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume", default=None, metavar="RUN_DIR",
         help="re-open an existing run dir and skip questions already judged",
+    )
+    parser.add_argument(
+        "--rerender", default=None, metavar="RUN_DIR",
+        help="re-render --findings-path from an existing run's results.jsonl and exit -- "
+        "no index, no BM25, no endpoint. Runs from before the grid carry legacy method "
+        "ids (`reform_dense`); those are canonicalised onto the grid and flagged.",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -204,109 +214,71 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# --- reformulation-as-retrieval ----------------------------------------------
-
-
-async def reformulate_query(question: MedQAQuestion, client: LLMClient) -> tuple[str, bool]:
-    """Rewrite the query with the existing reformulation prompt; fall back on failure.
-
-    Reuses `build_reformulation_prompt()` as-is rather than waiting for
-    Phase 7's `Reformulator` module, to get an early read on PLAN.md's open
-    question 15 (does reformulation move retrieval recall at all). Every
-    fallback is logged, per PLAN.md's convention for the real `Reformulator`.
-    """
-    prompt = build_reformulation_prompt(question.question)
-    try:
-        result = await client.agenerate(prompt)
-        data = json.loads(result.content)
-        need = data.get("information_need")
-        if isinstance(need, str) and need.strip():
-            return need.strip(), False
-        logger.warning(
-            "q{}: reformulation JSON had no usable information_need ({!r}) -- "
-            "falling back to the original question",
-            question.id,
-            data,
-        )
-    except LLMError as exc:
-        logger.warning(
-            "q{}: reformulation call failed ({}) -- falling back to the original question",
-            question.id,
-            exc,
-        )
-        raise
-    except (json.JSONDecodeError, AttributeError) as exc:
-        logger.warning(
-            "q{}: reformulation response was not parsable JSON ({}) -- "
-            "falling back to the original question",
-            question.id,
-            exc,
-        )
-    return question.question, True
-
-
-# --- candidate generation per method -----------------------------------------
-
-
-async def gather_candidates(
-    question: MedQAQuestion,
-    retriever: Retriever,
-    bm25_index: Any,
-    reformulator: LLMClient,
-    top_k: int,
-    rerank_k: int,
-) -> tuple[dict[str, list[RetrievedChunk]], str, bool]:
-    """One retrieval pass per method for `question`.
-
-    Dense candidates are retrieved once and reused for `dense`,
-    `dense_rerank`, and as one input to `hybrid` -- `Retriever.rerank()`
-    truncates and overwrites `score`, so the pre-rerank list is what feeds
-    fusion, matching `raw_rag.py`'s `retrieve_pass()`.
-    """
-    dense = await asyncio.to_thread(retriever.retrieve, question.question, top_k)
-    dense_rerank = await asyncio.to_thread(retriever.rerank, question.question, dense, rerank_k)
-    bm25 = await asyncio.to_thread(bm25_index.search, question.question, top_k)
-    hybrid = rrf_fuse(dense, bm25, top_k=top_k)
-    hybrid_rerank = await asyncio.to_thread(retriever.rerank, question.question, hybrid, rerank_k)
-
-    reformulated_query, fallback = await reformulate_query(question, reformulator)
-    reform_dense = await asyncio.to_thread(retriever.retrieve, reformulated_query, top_k)
-
-    candidates = {
-        "dense": dense,
-        "dense_rerank": dense_rerank,
-        "bm25": bm25,
-        "hybrid": hybrid,
-        "hybrid_rerank": hybrid_rerank,
-        "reform_dense": reform_dense,
-    }
-    return candidates, reformulated_query, fallback
+# --- reformulation and retrieval ---------------------------------------------
+#
+# Both live in shared modules now: `reformulate.reformulate_query()` (tolerant
+# parsing, and a fallback that is *recorded* instead of only logged) and
+# `strategies.aretrieve_grid()` (5 strategies x 2 query variants). They used to
+# be in this file, and `gather_candidates()` implemented a sixth "method" called
+# `reform_dense` -- one retrieval on a rewritten query, judged against nothing
+# comparable. The grid replaced it; keeping a second copy of either here is how
+# FINDINGS.md and a report end up disagreeing.
 
 
 # --- plan / cost printing ----------------------------------------------------
 
 
 def print_plan(
-    args: argparse.Namespace, config: ExperimentConfig, sample: list[MedQAQuestion], gold: Any
+    args: argparse.Namespace,
+    config: ExperimentConfig,
+    sample: list[MedQAQuestion],
+    gold: Any,
+    cache_counts: dict[str, int] | None = None,
 ) -> None:
     split = args.split or config.dev_split
+    top_k = args.top_k or config.retrieval.top_k_retrieve
+    rerank_k = args.rerank_k or config.retrieval.top_k_rerank
+    bm25_top_k = args.bm25_top_k or top_k
     print(f"phase={PHASE} condition_id={CONDITION_ID} split={split}")
     print(f"pinned sample ({len(sample)} question(s)):")
     print("  " + ",".join(question.id for question in sample))
     print(f"  gold letters: {dict(sorted(gold.items()))}")
     print()
-    print(f"methods compared (same judge cache): {', '.join(METHOD_NAMES)}")
+    print(f"methods compared (same verdict cache): {', '.join(METHOD_NAMES)}")
+    print(
+        f"  = {len(METHOD_GRID)} cells: {' x '.join(BASE_STRATEGIES)} "
+        f"x {' x '.join(QUERY_VARIANTS)}"
+    )
     print(f"k values reported: {K_VALUES}")
+    print(
+        f"depth: top_k={top_k} -> rerank {rerank_k}; bm25_top_k={bm25_top_k}; "
+        f"reranker shown the {args.rerank_with}"
+    )
     print()
     judge = config.models["judge_model"]
     reform = config.models["model_a"]
     print(f"judge: {judge.api_model_name} @ {judge.base_url}")
     print(f"reformulator: {reform.api_model_name} @ {reform.base_url}")
+    if args.reform_prompt:
+        print(f"reform prompt: OVERRIDDEN by {args.reform_prompt} (not production wording)")
+    if not args.no_reform:
+        print("reform fallback policy: tolerant parse, then structured retry, then recorded "
+              "fallback -- a fell-back row is marked and its __reform column is a copy")
+    if cache_counts:
+        print(
+            f"verdict cache: {cache_counts.get('loaded', 0)} usable ({args.judge_cache})"
+            + (f", {cache_counts.get('stale_prompt', 0)} stale" if cache_counts.get("stale_prompt") else "")
+        )
     print()
+    # Judge cost is bounded by the chunks the grid surfaces, not by the number of
+    # methods -- that is the whole point of judging the union once. Stating it as
+    # "20 calls" understated it: 10 methods union to ~70-80 chunks per question.
+    union_estimate = int(2.9 * top_k)
+    batches = max(1, -(-union_estimate // args.judge_batch))
     print(
-        f"planned calls: {len(sample)} judge call(s) + {len(sample)} reformulation "
-        f"call(s) = {2 * len(sample)} total (one judge call per question covers every "
-        "method's union of candidates)"
+        f"planned calls, worst case (empty cache): {len(sample)} reformulation + "
+        f"~{len(sample) * batches} judge batches ({union_estimate}ish chunks/question "
+        f"at {args.judge_batch} per batch). Cached pairs cost nothing."
     )
 
 
@@ -316,74 +288,108 @@ def print_plan(
 def compute_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Per-method semantic_recall@k / relevant_fraction@k / first-relevant-rank.
 
-    Reads only successful rows (`"error" not in row`); each row already
-    carries every method's ordered candidate ids and the judge's verdicts for
-    the union of chunk_ids any method surfaced for that question.
+    Thin wrapper over `metrics.aggregate`, which holds the formulas. The wrapper
+    stays because `render_findings` and older notebooks call it here, and because
+    pinning `METHOD_NAMES` at the call site is what guarantees the FINDINGS table
+    has a row for every cell of the grid -- including one whose column came back
+    empty, whose absence is itself a result.
+
+    Rows are canonicalised first (see `canonicalize_rows`), so a run stored with
+    the old flat method ids aggregates into the same grid as a new one instead of
+    silently producing `n=0` for every method.
+    """
+    return aggregate(canonicalize_rows(rows), METHOD_NAMES, K_VALUES)
+
+
+def load_run_rows(run_dir: Path) -> list[dict[str, Any]]:
+    """Read a run's `results.jsonl` back, skipping anything unparseable.
+
+    Used by `--rerender`. Torn final lines are a normal artifact of killing a run
+    mid-write, and a re-render that dies on one is a re-render you can't do.
+    """
+    path = Path(run_dir)
+    if path.is_dir():
+        path = path / "results.jsonl"
+    if not path.exists():
+        raise SystemExit(f"no results.jsonl to re-render at {path}")
+    rows: list[dict[str, Any]] = []
+    skipped = 0
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                skipped += 1
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    if skipped:
+        logger.warning(f"{path}: skipped {skipped} unparseable line(s)")
+    if not rows:
+        raise SystemExit(f"{path} contained no readable rows")
+    return rows
+
+
+def canonicalize_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Re-key stored candidate lists onto `METHOD_GRID` ids.
+
+    Runs before the grid stored `dense`, `reform_dense`, ... as six peer methods.
+    `strategies.LEGACY_METHOD_ALIASES` maps those onto grid cells and marks them
+    aliased, because `reform_dense` was *one* retrieval with nothing comparable
+    beside it -- renaming it silently would let the same number read as a measured
+    reform result. Anything unrecognised is dropped and recorded rather than
+    guessed at.
+    """
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        candidates = row.get("candidates") or {}
+        mapped: dict[str, Any] = {}
+        moved: list[str] = []
+        dropped: list[str] = []
+        for name, chunk_ids in candidates.items():
+            try:
+                method, aliased = canonical_method(name)
+            except ValueError:
+                dropped.append(name)
+                continue
+            if method in mapped:
+                dropped.append(name)
+                continue
+            mapped[method] = chunk_ids
+            if aliased:
+                moved.append(f"{name}->{method}")
+        if not moved and not dropped:
+            out.append(row)
+            continue
+        new_row = dict(row)
+        new_row["candidates"] = mapped
+        if moved:
+            new_row["legacy_method_ids"] = sorted(set(moved))
+        if dropped:
+            new_row["dropped_method_ids"] = dropped
+        out.append(new_row)
+    return out
+
+
+def render_findings(
+    metrics: dict[str, Any],
+    rows: list[dict[str, Any]],
+    run_dir: Path,
+    legacy: Sequence[str] = (),
+) -> str:
+    """The tracked table, plus the integrity check that makes it readable.
+
+    The Δ table is the reason the grid exists. `recall@k` per method was already
+    computable from six flat columns, and it produced a conclusion about
+    reformulation that its own `reform_dense` column could not support. Comparing
+    each strategy against *itself* under the other query variant is the only
+    reading that isolates the lever -- and the integrity block states how many of
+    this run's rows even had a rewritten query to compare.
     """
     usable = [row for row in rows if "error" not in row]
-    summary: dict[str, Any] = {"n_questions": len(usable), "methods": {}}
-    if not usable:
-        return summary
-
-    for method in METHOD_NAMES:
-        per_k = {k: {"recall_hits": 0, "relevant_fractions": []} for k in K_VALUES}
-        first_ranks: list[int] = []
-        n = 0
-        for row in usable:
-            candidates = row["candidates"].get(method)
-            if candidates is None:
-                continue
-            n += 1
-            judgments = row["judgments"]
-            gold = row["correct_answer"]
-
-            for k in K_VALUES:
-                top = candidates[:k]
-                hit = any(
-                    gold in judgments.get(chunk_id, {}).get("supports_options", [])
-                    for chunk_id in top
-                )
-                per_k[k]["recall_hits"] += int(hit)
-                relevant = sum(
-                    1
-                    for chunk_id in top
-                    if judgments.get(chunk_id, {}).get("relevance") in RELEVANT_LEVELS
-                )
-                per_k[k]["relevant_fractions"].append(relevant / len(top) if top else 0.0)
-
-            rank = next(
-                (
-                    rank
-                    for rank, chunk_id in enumerate(candidates, start=1)
-                    if judgments.get(chunk_id, {}).get("relevance") == "relevant"
-                ),
-                None,
-            )
-            if rank is not None:
-                first_ranks.append(rank)
-
-        summary["methods"][method] = {
-            "n": n,
-            "per_k": {
-                k: {
-                    "semantic_recall": round(per_k[k]["recall_hits"] / n, 3) if n else None,
-                    "relevant_fraction": round(
-                        sum(per_k[k]["relevant_fractions"]) / n, 3
-                    )
-                    if n
-                    else None,
-                }
-                for k in K_VALUES
-            },
-            "mean_first_relevant_rank": round(sum(first_ranks) / len(first_ranks), 2)
-            if first_ranks
-            else None,
-        }
-    return summary
-
-
-def render_findings(metrics: dict[str, Any], rows: list[dict[str, Any]], run_dir: Path) -> str:
-    """The tracked comparison table plus a few judgments worth reading by hand."""
     lines = [
         "# Retrieval tuning -- judge harness FINDINGS",
         "",
@@ -393,6 +399,11 @@ def render_findings(metrics: dict[str, Any], rows: list[dict[str, Any]], run_dir
         "chunk's `supports_options` within the top-k. `relevant_fraction@k`: mean fraction of "
         "the top-k chunks judged `relevant`/`partial`. `mean_first_relevant_rank`: average rank "
         "of the first `relevant` chunk (blank = never, for the questions it covers).",
+        "",
+        "Methods are `<strategy>__<query variant>` (`strategies.METHOD_GRID`): the five "
+        "strategies run on the question text (`__orig`) and on the reformulated information "
+        "need (`__reform`). `inspect_retrieval.py --from-run <this run>` renders the chunks "
+        "behind every number below.",
         "",
         "| method | n | " + " | ".join(f"recall@{k}" for k in K_VALUES) + " | "
         + " | ".join(f"rel_frac@{k}" for k in K_VALUES) + " | mean_first_rank |",
@@ -405,7 +416,105 @@ def render_findings(metrics: dict[str, Any], rows: list[dict[str, Any]], run_dir
         rank_cell = "-" if stats["mean_first_relevant_rank"] is None else stats["mean_first_relevant_rank"]
         lines.append(f"| {method} | {stats['n']} | {recall_cells} | {frac_cells} | {rank_cell} |")
 
-    lines += ["", "## Example judgments", ""]
+    lines += [
+        "",
+        "## Reformulation, per strategy (Δ = `__reform` minus `__orig`)",
+        "",
+        "| strategy | " + " | ".join(f"Δrecall@{k}" for k in K_VALUES)
+        + " | Δmean_first_rank | identical columns |",
+        "| --- | " + " | ".join("---" for _ in K_VALUES) + " | --- | --- |",
+    ]
+    for base in BASE_STRATEGIES:
+        orig = metrics["methods"].get(f"{base}__orig")
+        reform = metrics["methods"].get(f"{base}__reform")
+        if not orig or not reform:
+            lines.append(f"| {base} | " + " | ".join("-" for _ in K_VALUES) + " | - | -- |")
+            continue
+        deltas = []
+        for k in K_VALUES:
+            here, there = orig["per_k"][k]["semantic_recall"], reform["per_k"][k]["semantic_recall"]
+            deltas.append("-" if here is None or there is None else f"{100 * (there - here):+.0f}pp")
+        first = (
+            "-"
+            if orig["mean_first_relevant_rank"] is None
+            or reform["mean_first_relevant_rank"] is None
+            else f"{reform['mean_first_relevant_rank'] - orig['mean_first_relevant_rank']:+.2f}"
+        )
+        lines.append(f"| {base} | " + " | ".join(deltas) + f" | {first} | {_identical_share(usable, base)} |")
+
+    if legacy:
+        lines += [
+            "",
+            "## Stored method ids",
+            "",
+            "This run predates the grid; its flat ids were aliased onto grid cells by "
+            "`strategies.LEGACY_METHOD_ALIASES`: "
+            + ", ".join(f"`{item}`" for item in legacy)
+            + ".",
+            "",
+            "Cells with `n = 0` were never retrieved by that run -- it ran the original query "
+            "through every strategy plus exactly one dense retrieval on the rewritten query. "
+            "Their Δ row is blank, not zero: a lever that was not run did not fail to work.",
+        ]
+
+    fallbacks = [row for row in usable if _reform_fallback(row)]
+    lines += [
+        "",
+        "## Reformulation integrity",
+        "",
+        "A fell-back reformulation returns the question unchanged, so that row's `__reform` "
+        "column is a copy of `__orig` and contributes a delta of exactly zero. Counting those "
+        "as measurements is the bug this section exists to make impossible to miss.",
+        "",
+        f"- questions whose reformulation **fell back**: **{len(fallbacks)}/{len(usable)}**"
+        + (f" ({', '.join('q' + str(row['question_id']) for row in fallbacks)})" if fallbacks else ""),
+    ]
+    stored_errors = {
+        str(row["question_id"]): _reform_record(row).get("error") for row in fallbacks
+    }
+    for question_id, error in sorted(stored_errors.items()):
+        if error:
+            lines.append(f"  - q{question_id}: {str(error)[:170]}")
+    if fallbacks and not any(stored_errors.values()):
+        # Worth one line, not eighteen: the run predates `ReformulationError`,
+        # so the cause is unrecoverable for every question equally.
+        lines.append(
+            "  - no per-question cause was stored for any of these -- the run predates "
+            "`reformulate.ReformulationError`, so *why* they fell back is unrecoverable"
+        )
+    if usable and len(fallbacks) == len(usable):
+        lines.append(
+            "- **every** `__reform` column above is a copy of its `__orig` column: the Δ "
+            "column measures BM25/fusion determinism, not reformulation. Do not quote it."
+        )
+    elif fallbacks:
+        lines.append(
+            "- read the Δ table with these rows excluded or re-run: each contributes a "
+            "forced zero and pulls every Δ toward nothing."
+        )
+    newly = sum(len(row.get("new_judgments") or []) for row in usable)
+    records_newly = any("new_judgments" in row for row in usable)
+    cache_path = next(
+        (row["judge_cache"] for row in usable if row.get("judge_cache")), None
+    )
+    if records_newly:
+        cache_note = (
+            f"- chunks newly judged by this run: {newly}"
+            + (
+                f" (the rest came from `{cache_path}` -- cached verdicts are reused across runs, "
+                "so this is what the run *paid for*, not what it read)"
+                if cache_path
+                else " (this run recorded no cache path, so the split between paid and reused "
+                "cannot be recovered)"
+            )
+        )
+    else:
+        cache_note = (
+            "- chunks newly judged by this run: not recorded -- this run predates the verdict "
+            "cache, so every judgment in it was paid for inside the run and none of it was "
+            "reusable afterwards"
+        )
+    lines += ["", cache_note, "", "## Example judgments", ""]
     example_relevant = _find_example(rows, "relevant")
     example_irrelevant = _find_example(rows, "irrelevant")
     for label, example in (("relevant", example_relevant), ("irrelevant", example_irrelevant)):
@@ -422,12 +531,57 @@ def render_findings(metrics: dict[str, Any], rows: list[dict[str, Any]], run_dir
         "",
         "## Recommendation",
         "",
-        "Fill in by hand after reading the table above: which method the Phase 6 rerun should "
-        "use, and whether reformulation-as-retrieval (`reform_dense`) moved recall enough to "
-        "keep the reformulation condition alive for Phase 7.",
+        "Fill in by hand after reading the table above *and* running "
+        "`inspect_retrieval.py --from-run <this run> --open`: which strategy the Phase 6 rerun "
+        "should use, and whether reformulation moved recall on the strategies where the rewrite "
+        "actually reached the embedder. A strategy whose `__reform` list is identical to "
+        "`__orig` proves nothing in either direction -- check the integrity section above "
+        "before believing any Δ in the table.",
         "",
     ]
     return "\n".join(lines)
+
+
+def _reform_record(row: dict[str, Any]) -> dict[str, Any]:
+    """The reformulation record, new shape or the legacy two-key shape.
+
+    Tolerating both is deliberate: `--resume`d runs from before this change carry
+    `reformulated_query`/`reformulation_fallback` only, and a findings renderer
+    that crashed on them would have made those runs unreportable -- the opposite of
+    the point, which is that their reformulation column must be visible as broken.
+    """
+    record = row.get("reformulation")
+    if isinstance(record, dict):
+        return record
+    return {
+        "query": row.get("reformulated_query"),
+        "fallback": row.get("reformulation_fallback"),
+        "error": None,
+    }
+
+
+def _reform_fallback(row: dict[str, Any]) -> bool:
+    return bool(_reform_record(row).get("fallback"))
+
+
+def _identical_share(rows: list[dict[str, Any]], base: str) -> str:
+    """Questions where this strategy's `__orig` and `__reform` lists are the same order.
+
+    For `dense` on the first run this was 20/20 -- the tell that the lever never
+    fired. Identical columns in a run where the rewrite *did* reach the embedder is
+    a legitimate finding (the corpus answers both queries the same way), which is
+    why this reports a share per strategy instead of asserting one cause.
+    """
+    same = total = 0
+    for row in rows:
+        candidates = row.get("candidates") or {}
+        orig, reform = candidates.get(f"{base}__orig"), candidates.get(f"{base}__reform")
+        if orig is None or reform is None:
+            continue
+        total += 1
+        same += int(list(orig) == list(reform))
+    return "-" if not total else f"{same}/{total}"
+
 
 
 def _fmt_pct(value: float | None) -> str:
@@ -449,7 +603,28 @@ def _find_example(
 # --- main ---------------------------------------------------------------
 
 
+def rerender(args: argparse.Namespace) -> int:
+    """Rebuild `--findings-path` from stored rows without touching the endpoint.
+
+    `--resume` re-opens a run to finish judging it; this re-opens one to *read* it
+    again. The two differ in cost: re-rendering is free, and after the grid and the
+    integrity block landed, the honest FINDINGS for the pre-grid run was a rendering
+    change, not a new experiment.
+    """
+    rows = canonicalize_rows(load_run_rows(Path(args.rerender)))
+    legacy = sorted({moved for row in rows for moved in row.get("legacy_method_ids") or []})
+    summary = compute_metrics(rows)
+    findings = render_findings(summary, rows, Path(args.rerender), legacy=legacy)
+    Path(args.findings_path).write_text(findings + "\n", encoding="utf-8")
+    print(findings)
+    print(f"\nre-rendered {len(rows)} row(s) from {args.rerender} -> {args.findings_path}")
+    return 0
+
+
 async def amain(args: argparse.Namespace) -> int:
+    if args.rerender:
+        return rerender(args)
+
     config = load_config(args.config)
     split = args.split or config.dev_split
     ids = list(args.question_ids or SAMPLE_QUESTION_IDS)
@@ -466,14 +641,21 @@ async def amain(args: argparse.Namespace) -> int:
 
     top_k = args.top_k or config.retrieval.top_k_retrieve
     rerank_k = args.rerank_k or config.retrieval.top_k_rerank
+    bm25_top_k = args.bm25_top_k or top_k
     index_dir = resolve_index_dir(config, args.index_dir)
+    template = load_template(args.reform_prompt)
+    judge_sha = judge_prompt_sha()
+    # Read the cache before printing the plan: "this run costs 20 judge calls" and
+    # "this run costs 4, the other 16 are already graded" are different decisions,
+    # and the plan is where that decision gets made.
+    cache, cache_counts = load_cache(args.judge_cache, judge_sha=judge_sha)
 
-    print_plan(args, config, sample, gold)
+    print_plan(args, config, sample, gold, cache_counts)
     if args.dry_run:
         print(
             "\ndry run -- no index load, no BM25 build, no preflight, no requests. Would write "
-            f"to {Path(args.output_dir) / PHASE}/<UTC-stamp>/ (results.jsonl, context.md) and "
-            f"render {args.findings_path}"
+            f"to {Path(args.output_dir) / PHASE}/<UTC-stamp>/ (results.jsonl, chunks.jsonl, "
+            f"context.md) and render {args.findings_path}"
         )
         return 0
 
@@ -516,8 +698,19 @@ async def amain(args: argparse.Namespace) -> int:
                 extra={
                     "condition_id": CONDITION_ID,
                     "methods": ", ".join(METHOD_NAMES),
+                    "grid": f"{len(BASE_STRATEGIES)} strategies x {len(QUERY_VARIANTS)} query variants",
                     "top_k": f"{top_k} -> rerank {rerank_k}",
+                    "bm25_top_k": bm25_top_k,
+                    "rerank_shown": args.rerank_with,
                     "bm25_index": str(args.bm25_index),
+                    "reformulation": (
+                        "skipped (--no-reform)"
+                        if args.no_reform
+                        else f"prompt: {args.reform_prompt or 'production build_reformulation_prompt()'}"
+                    ),
+                    "judge_prompt_sha": judge_sha,
+                    "judge_cache": f"{args.judge_cache} ({cache_counts.get('loaded', 0)} cached)",
+                    "judge_batch": args.judge_batch,
                     **parse_notes(args.note),
                 },
             )
@@ -536,84 +729,124 @@ async def amain(args: argparse.Namespace) -> int:
                     break
 
                 print(f"--- q{question.id} ({index}/{len(sample)}) ---")
-                try:
-                    candidates, reformulated_query, fallback = await gather_candidates(
-                        question, retriever, bm25_index, reformulator, top_k, rerank_k
-                    )
-                    reform_breaker.record_success()
-                except LLMError as exc:
-                    reform_breaker.record_failure(exc)
-                    writer.write_row(
-                        error_row(
-                            model=reform_model, question=question, tag="judge",
-                            condition_id=CONDITION_ID, split=split, exc=exc, wall_s=0.0,
+                reform = None
+                if not args.no_reform:
+                    try:
+                        reform = await reformulate_query(question, reformulator, template=template)
+                        reform_breaker.record_success()
+                    except LLMError as exc:
+                        reform_breaker.record_failure(exc)
+                        writer.write_row(
+                            error_row(
+                                model=reform_model, question=question, tag="judge",
+                                condition_id=CONDITION_ID, split=split, exc=exc, wall_s=0.0,
+                            )
                         )
+                        problems.append(f"q{question.id}: reformulation call failed: {exc}")
+                        continue
+
+                try:
+                    grid = await aretrieve_grid(
+                        question.question,
+                        retriever,
+                        bm25_index,
+                        reformulated_text=reform.query if reform else None,
+                        top_k=top_k,
+                        rerank_k=rerank_k,
+                        bm25_top_k=bm25_top_k,
+                        rerank_with=args.rerank_with,
                     )
-                    problems.append(f"q{question.id}: reformulation call failed: {exc}")
-                    continue
                 except Exception as exc:  # noqa: BLE001 - retrieval/bm25 failure, not an LLM error
                     problems.append(f"q{question.id}: candidate generation failed: {exc}")
                     continue
 
-                chunk_lookup: dict[str, RetrievedChunk] = {}
-                for chunks in candidates.values():
-                    for chunk in chunks:
-                        chunk_lookup.setdefault(chunk.chunk_id, chunk)
+                chunk_lookup = grid.all_chunks()
                 union_ids = sorted(chunk_lookup)
                 union_chunks = [chunk_lookup[chunk_id] for chunk_id in union_ids]
 
-                prompt = build_judge_prompt(question, union_chunks)
                 try:
-                    verdict = await judge.agenerate_structured(
-                        prompt, JudgeVerdict, system_prompt=_JUDGE_SYSTEM_PROMPT
+                    outcome = await ensure_verdicts(
+                        question,
+                        union_chunks,
+                        cache,
+                        client=judge,
+                        cache_path=args.judge_cache,
+                        breaker=judge_breaker,
+                        batch=args.judge_batch,
+                        judge_sha=judge_sha,
+                        source_run=writer.stamp,
                     )
-                    judge_breaker.record_success()
                 except LLMError as exc:
-                    judge_breaker.record_failure(exc)
+                    # `ensure_verdicts` already appended whatever earlier batches
+                    # returned, so a failure here costs the failed batch, not the
+                    # question's whole candidate set, on the next `--resume`.
                     writer.write_row(
                         error_row(
                             model=judge_model, question=question, tag="judge",
                             condition_id=CONDITION_ID, split=split, exc=exc, wall_s=0.0,
-                            prompt=prompt,
                         )
                     )
                     problems.append(f"q{question.id}: judge call failed: {exc}")
                     continue
+                problems.extend(f"q{question.id}: {problem}" for problem in outcome.problems)
 
-                judgments = {item.chunk_id: item.model_dump() for item in verdict.judgments}
-                missing = set(union_ids) - set(judgments)
-                if missing:
-                    logger.warning(
-                        "q{}: judge omitted {} of {} candidate chunk(s): {}",
-                        question.id, len(missing), len(union_ids), sorted(missing),
-                    )
-
+                judgments = {
+                    chunk_id: {
+                        "relevance": record["relevance"],
+                        "supports_options": record["supports_options"],
+                        "reason": record.get("reason", ""),
+                    }
+                    for chunk_id, record in outcome.verdicts.items()
+                }
                 row = {
                     "model": judge_model.name,
                     "question_id": question.id,
                     "tag": "judge",
                     "condition_id": CONDITION_ID,
                     "split": split,
+                    "question": question.question,
+                    "options": question.options,
                     "correct_answer": question.answer_idx.upper(),
-                    "reformulated_query": reformulated_query,
-                    "reformulation_fallback": fallback,
+                    "queries": grid.variant_queries,
+                    "reformulation": (
+                        reform.model_dump()
+                        if reform
+                        else {"query": None, "fallback": False, "method": "skipped (--no-reform)"}
+                    ),
                     "candidates": {
                         name: [chunk.chunk_id for chunk in chunks]
-                        for name, chunks in candidates.items()
+                        for name, chunks in grid.lists.items()
                     },
                     "judgments": judgments,
+                    "new_judgments": outcome.new_chunk_ids,
+                    "judge_cache": str(args.judge_cache),
+                    "judge_prompt_sha": judge_sha,
                     "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 }
                 writer.write_row(row)
+                # The sidecar is the difference between a run you can re-read and a
+                # run you can only re-aggregate: `results.jsonl` stores ids, and the
+                # text they name otherwise costs a 467 MB pickle load to recover.
+                append_chunks(writer.dir / "chunks.jsonl", union_chunks)
+                identical = sum(
+                    1
+                    for base in BASE_STRATEGIES
+                    if grid.lists.get(f"{base}__orig") == grid.lists.get(f"{base}__reform")
+                )
                 print(
-                    f"  judged {len(union_ids)} unique chunk(s) across {len(candidates)} "
-                    f"method(s){' (reformulation fell back)' if fallback else ''}"
+                    f"  {len(union_ids)} unique chunk(s) across {len(grid.lists)} method(s): "
+                    f"{outcome.cached} cached, {outcome.judged} newly judged in "
+                    f"{outcome.batches} batch(es)"
+                    + (f"; reformulation FELL BACK ({reform.error})" if reform and reform.fallback else "")
+                    + (f"; {identical}/{len(BASE_STRATEGIES)} strategies retrieved identically")
                 )
 
             rows = writer.load_rows()
 
+    rows = canonicalize_rows(rows)
+    legacy = sorted({moved for row in rows for moved in row.get("legacy_method_ids") or []})
     metrics = compute_metrics(rows)
-    findings = render_findings(metrics, rows, writer.dir)
+    findings = render_findings(metrics, rows, writer.dir, legacy=legacy)
     Path(args.findings_path).write_text(findings + "\n", encoding="utf-8")
     print("\n" + findings)
     print(f"\nartifacts: {writer.dir}")

@@ -51,6 +51,7 @@ tests/test_pipeline.py         Smoke test: package imports and has __version__.
 tests/test_config.py           load_config() success + undefined-model-reference rejection.
 tests/test_data_loading.py     MedQA loader schema/count (live) + StatPearls chunker logic (fixture, no network).
 tests/test_retrieval.py        Embedder shape, index build/save/load round-trip, retrieve() relevance, rerank() reordering.
+tests/test_retrieval_tuning.py The side-track offline: grid shape, candidate assembly, metrics, cache keying/eviction, chunk sidecar, and that legacy runs re-render without inventing comparisons.
 tests/test_generation.py       Prompt builders, parse_answer tiers, LLMClient over httpx.MockTransport, + one `live` endpoint test.
 tests/test_reformulator.py     [STUB] Placeholder for reformulator tests.
 tests/test_verifier.py         [STUB] Placeholder for verifier tests.
@@ -59,6 +60,18 @@ data/                          Gitignored. Cached corpora (data/statpearls/) and
 experiments/                   Tracked (deliberately NOT gitignored). Per-phase FINDINGS.md plus the failure chains each phase chose to keep — Phase 10's evidence base. [Phase 5 onwards]
 experiments/README.md          The convention in one page: what is tracked, the rules, how to start a new FINDINGS file.
 experiments/TEMPLATE.md        Skeleton that experiments/phaseN/FINDINGS.md is copied from.
+experiments/retrieval_tuning/  Tracked. The Phase 6 retrieval side-track: plan, harness, and FINDINGS. Code lives here rather than in src/ because it is measurement scaffolding, not pipeline code.
+experiments/retrieval_tuning/TUNING.md               The plan: methods under comparison, metrics, what a run costs, and what the first run actually showed (read this before re-running anything).
+experiments/retrieval_tuning/FINDINGS.md             Written by judge_harness.py, never by hand; `--rerender <run>` rebuilds it from a run dir with zero endpoint calls.
+experiments/retrieval_tuning/judge_harness.py        The grid runner: retrieve → judge the union → metrics → FINDINGS. `--rerender` re-renders an existing run offline.
+experiments/retrieval_tuning/strategies.py           METHOD_GRID (5 strategies × {__orig, __reform}), LEGACY_METHOD_ALIASES, and the candidate-list builders.
+experiments/retrieval_tuning/judge_prompt.py         The rubric. Its sha256 is part of every cache key, so editing it invalidates every verdict.
+experiments/retrieval_tuning/judge_cache.py          The verdict cache (judge_cache/judged_chunks.jsonl): load / ensure_verdicts / stats.
+experiments/retrieval_tuning/chunk_store.py          chunks.jsonl sidecar — stores the chunk text a run retrieved, so re-reading a run does not need the 380k-row index.
+experiments/retrieval_tuning/render.py               One grid renderer, three outputs: terminal text, report.html, and view_from_row() for re-reading stored rows.
+experiments/retrieval_tuning/inspect_retrieval.py    The inspector: `--question-id` / `--sample` (live) or `--from-run` (offline), writes the artifact set.
+experiments/retrieval_tuning/{metrics,hybrid,bm25_index,reformulate}.py  Recall/precision math, fusion, the lexical index, and query reformulation.
+outputs/exploration/retrieval_tuning/ Gitignored. `<UTC-stamp>/` harness runs and `<out-name>/` inspector dirs (results.jsonl, chunks.jsonl, report.html, questions/, context.md), plus the shared judge_cache/.
 outputs/probes/                Gitignored. probe_models.py rows + chains; in use since Phase 4.
 outputs/exploration/           Gitignored. Raw run dirs from scripts/exploration/ (results.jsonl, chains/<stamp>/, context.md).
 outputs/runs/                  Gitignored. Pilot and confirmatory results (Phases 9/13) — the only outputs/ tree RESULTS.md may cite.
