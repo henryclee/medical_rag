@@ -16,13 +16,20 @@
     # keep the embedder and BM25 loaded, poke at several questions
     .venv/bin/python experiments/retrieval_tuning/inspect_retrieval.py --repl
 
+    # the same loaded state, driven from the browser instead of the terminal
+    .venv/bin/python experiments/retrieval_tuning/inspect_retrieval.py --serve
+
+    # browse yesterday's verdicts with nothing loaded at all
+    .venv/bin/python experiments/retrieval_tuning/inspect_retrieval.py --serve --no-retrieve \
+        --from-run outputs/exploration/retrieval_tuning/grid_smoke_check
+
 Why: `FINDINGS.md` claims `dense` reached 65% and `bm25` 10%. Those numbers are
 not actionable until you can read the chunk `dense_rerank` put at #1 and the one
 it left at #17, so this tool is built for reading rather than for scoring -- and
 for reading *both* query variants side by side, because "did reformulation help"
 is the question this directory exists to answer.
 
-Two modes, deliberately different costs:
+Three modes, deliberately different costs:
 
 * **read** (`--from-run`) -- zero LLM calls, zero models. Chunk text comes from
   the run's `chunks.jsonl` sidecar if it has one, else a LanceDB filter query.
@@ -34,6 +41,13 @@ Two modes, deliberately different costs:
   for `(question, chunk)` pairs missing from `judge_cache/judged_chunks.jsonl`.
   Re-inspecting a question you looked at yesterday is free; the first look costs
   one judge batch per ~24 new chunks.
+* **served** (`--serve`) -- the live world behind a localhost form (see `serve.py`),
+  for when the reading is the point: the knob you want to move and the 40 chunk
+  bodies you want to read were in different windows, and `render_terminal` truncates
+  bodies to 110 chars on its way to saying so. Loads once, then a knob change is one
+  round trip instead of a re-run. Judging stays a button, so no completion gets spent
+  by a page refresh. `--no-retrieve` keeps the page but loads nothing, to browse
+  cached verdicts only.
 
 Free-text probing (`--question ... --option A=... --answer A`) runs the same grid
 on a question that is not in MedQA at all -- the cheapest way to find out why
@@ -49,6 +63,7 @@ import json
 import sys
 import webbrowser
 from contextlib import AsyncExitStack
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -130,6 +145,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     modes.add_argument(
         "--repl", action="store_true",
         help="interactive loop: keep the embedder and BM25 loaded between questions",
+    )
+    modes.add_argument(
+        "--serve", action="store_true",
+        help="serve the grid on http://HOST:PORT and drive this process from the browser. "
+        "Same loaded state as --repl (pay the ~40s load once) with the reading surface "
+        "you actually read it in; see serve.py. Mutually exclusive with --repl",
+    )
+    modes.add_argument("--host", default="127.0.0.1", help="--serve bind address (default: localhost only)")
+    modes.add_argument(
+        "--port", type=int, default=8712,
+        help="--serve port; 0 picks a free one and prints it (two sessions side by side)",
+    )
+    modes.add_argument(
+        "--no-retrieve", action="store_true",
+        help="with --serve: browse the cached verdicts for --from-run's rows and load no "
+        "retriever, BM25 pickle or endpoint. Retrieval and probe buttons render disabled",
     )
 
     grid = parser.add_argument_group("grid knobs")
@@ -587,13 +618,21 @@ class Inspector:
 
 
 def views_from_run(
-    insp: Inspector, rows: Sequence[dict[str, Any]], pool_by_id: dict[str, MedQAQuestion]
+    insp: Inspector,
+    rows: Sequence[dict[str, Any]],
+    pool_by_id: dict[str, MedQAQuestion],
+    *,
+    quiet: bool = False,
 ) -> list[QuestionView]:
     """Read mode: rows -> views, resolving chunk text once for the whole run.
 
     One `resolve_chunks` call for the union of ids, not one per question: each
     LanceDB filter query is a full scan of the table, so per-question resolution
     would turn a free replay into a multi-minute one for 20 questions.
+
+    `quiet` skips the terminal dumps, which `--serve` needs: twenty grids printed
+    above the URL is twenty grids nobody asked for yet, and the point of serving is
+    that the browser is where the reading happens.
     """
     args = insp.args
     usable = [row for row in rows if "error" not in row]
@@ -631,7 +670,8 @@ def views_from_run(
             chunk_source=source,
         )
         views.append(view)
-        print(render_terminal(view, max_chunks=(args.max_chunks or None)), flush=True)
+        if not quiet:
+            print(render_terminal(view, max_chunks=(args.max_chunks or None)), flush=True)
     insp.views.extend(views)
     return views
 
@@ -771,7 +811,39 @@ async def run_repl(insp: Inspector, pool: Sequence[MedQAQuestion]) -> None:
             print(f"endpoint error: {exc}")
 
 
-async def amain(args: argparse.Namespace) -> int:
+@dataclass
+class Ready:
+    """Everything loaded that a mode needs before it acts on a question."""
+
+    config: Any
+    insp: Inspector
+    pool: list[MedQAQuestion]
+    targets: list[MedQAQuestion]
+    rows: list[dict[str, Any]]
+
+    @property
+    def read_mode(self) -> bool:
+        return bool(self.insp.args.from_run)
+
+    @property
+    def pool_by_id(self) -> dict[str, MedQAQuestion]:
+        return {question.id: question for question in self.pool}
+
+
+def prepare(args: argparse.Namespace) -> Ready:
+    """Config, split, Inspector, targets -- the setup every mode shares.
+
+    Extracted so `--serve` cannot drift from the CLI it is meant to replace: the
+    pinned-sample resolution, the `.env` load behind `load_config`, and the
+    "refuse rather than render an empty page" guard all apply to the browser path
+    exactly as they do to the terminal one. Two copies of a guard is how one path
+    starts accepting input the other rejects.
+    """
+    if args.serve and args.repl:
+        raise SystemExit(
+            "--serve and --repl are mutually exclusive -- both own the process between "
+            "questions, and only one gets to keep the terminal"
+        )
     config = load_config(args.config)
     read_mode = bool(args.from_run)
     rows = read_rows(Path(args.from_run)) if read_mode else []
@@ -782,7 +854,7 @@ async def amain(args: argparse.Namespace) -> int:
     # `--question`-only probe, do not. If the load fails in read mode the report
     # still renders -- ids and verdicts are the part that cost money.
     need_pool = bool(
-        args.question_id or args.all or args.question or args.repl
+        args.question_id or args.all or args.question or args.repl or args.serve
         or (read_mode and any("question" not in row for row in rows))
     )
     pool: list[MedQAQuestion] = []
@@ -796,8 +868,9 @@ async def amain(args: argparse.Namespace) -> int:
 
     insp = Inspector(args, config)
     targets = [] if read_mode else resolve_target_questions(args, pool)
+    mode = "served" if args.serve else ("read-only replay" if read_mode else "live retrieval")
     print(
-        f"mode={'read-only replay' if read_mode else 'live retrieval'} split={insp.split} "
+        f"mode={mode} split={insp.split} "
         f"top_k={insp.top_k}->rerank {insp.rerank_k} bm25_top_k={insp.bm25_top_k} "
         f"rerank_with={insp.rerank_with} columns={'orig only' if args.no_reform else 'orig+reform'} "
         f"ks={insp.ks}"
@@ -807,26 +880,34 @@ async def amain(args: argparse.Namespace) -> int:
     else:
         print(f"targets: {', '.join('q' + question.id for question in targets) or '(none)'}")
 
+    if not read_mode and not targets and not args.repl and not args.serve:
+        raise SystemExit(
+            "nothing to inspect: pass --question-id / --all / --question ..., or --repl, "
+            "or --serve, or --from-run"
+        )
+    return Ready(config=config, insp=insp, pool=pool, targets=targets, rows=rows)
+
+
+async def amain(args: argparse.Namespace) -> int:
+    ready = prepare(args)
+    insp = ready.insp
+
     if args.dry_run:
         print(
             "\ndry run -- no index, no BM25, no models, no requests. Would write to "
             f"{insp.out_dir}/ (report.html, questions/*.md, results.jsonl, chunks.jsonl, context.md)"
         )
         return 0
-    if not read_mode and not targets and not args.repl:
-        raise SystemExit(
-            "nothing to inspect: pass --question-id / --all / --question ..., or --repl, or --from-run"
-        )
 
-    await insp.open(retrieval=not read_mode, judge=not (read_mode or args.no_judge))
+    await insp.open(retrieval=not ready.read_mode, judge=not (ready.read_mode or args.no_judge))
     status = 0
     try:
         if args.repl:
-            await run_repl(insp, pool)
-        elif read_mode:
-            views_from_run(insp, rows, {question.id: question for question in pool})
+            await run_repl(insp, ready.pool)
+        elif ready.read_mode:
+            views_from_run(insp, ready.rows, ready.pool_by_id)
         else:
-            status = await run_live(insp, targets)
+            status = await run_live(insp, ready.targets)
     finally:
         written = write_artifacts(insp.out_dir, insp.views, insp.meta(), html=not args.no_html)
         await insp.close()
@@ -841,8 +922,78 @@ async def amain(args: argparse.Namespace) -> int:
     return status
 
 
+ROUTES = """  GET  /             the page (toolbar + every question inspected this session)
+  GET  /api/state    the knobs the server is actually running with
+  GET  /api/chunk    ?id=<chunk_id> -- resolve one body (sidecar, then LanceDB)
+  POST /api/inspect  {question_id?, query?} -- the 5x2 grid, verdicts from cache, 0 calls
+  POST /api/judge    {} -- grade the unjudged chunks; spends completions, caches results
+  POST /api/knobs    {top_k, rerank_k, bm25_top_k, rerank_with, ks} -- set and re-retrieve
+  POST /api/probe    {text} -- corpus ceiling probe (uses the gold answer)
+  POST /api/report   {} -- write report.html + rows + sidecar + probes.jsonl"""
+
+
+def serve_main(args: argparse.Namespace) -> int:
+    """`--serve`: prepare the world, hand it to `serve.serve()`, block on the port.
+
+    Deliberately *not* run under `asyncio.run(amain(...))`. `serve()` owns the only
+    loop the Inspector and its endpoint clients may live on; calling it from `amain`
+    would either block that loop for the life of the server (harmless today, a
+    freeze the moment anything else wants it) or open the clients on the wrong loop.
+    So the server path takes the shared `prepare()` and then goes sync.
+    """
+    ready = prepare(args)
+    insp = ready.insp
+    if args.dry_run:
+        print(
+            f"\ndry run -- binding nothing, loading nothing.\n  would serve http://{args.host}:{args.port}/ "
+            f"from {insp.out_dir}/\n{ROUTES}"
+        )
+        return 0
+
+    from serve import serve
+
+    from judge_harness import SAMPLE_QUESTION_IDS  # noqa: PLC0415 - as in resolve_target_questions
+
+    # `--no-retrieve` implies no judging: with nothing to retrieve there are no new
+    # chunks to grade, and loading the client would run preflight -- a real
+    # completion -- to prepare an endpoint this session cannot use.
+    retrieval = not args.no_retrieve
+    judge = retrieval and not (ready.read_mode or args.no_judge)
+    pool_by_id = ready.pool_by_id
+    rows = list(ready.rows)
+    # Offer the pinned sample rather than all 10,178 dev-split ids: the field still
+    # accepts any of them, but the page should not ship 200 KB of <option> markup to
+    # suggest a list nobody scrolls, and the pinned 20 are the ones PLAN.md keeps
+    # this project coming back to.
+    browse = [cid for cid in SAMPLE_QUESTION_IDS if cid in pool_by_id]
+
+    async def seed() -> list[tuple[MedQAQuestion | None, QuestionView]]:
+        """Rows -> views, on the backend loop, once the index handle exists.
+
+        Chunk resolution is a LanceDB scan (and for the pre-sidecar run, the only
+        expensive one), so it goes off the loop. A view whose question is not in the
+        split keeps its `None` -- see `serve.SessionItem`.
+        """
+        views = await asyncio.to_thread(views_from_run, insp, rows, pool_by_id, quiet=True)
+        return [(pool_by_id.get(view.question_id), view) for view in views]
+
+    return serve(
+        insp,
+        pool_by_id,
+        host=args.host,
+        port=args.port,
+        retrieval=retrieval,
+        judge=judge,
+        browse=browse,
+        on_open=(seed if ready.read_mode else None),
+    )
+
+
 def main() -> None:
-    raise SystemExit(asyncio.run(amain(parse_args())))
+    args = parse_args()
+    if args.serve:
+        raise SystemExit(serve_main(args))
+    raise SystemExit(asyncio.run(amain(args)))
 
 
 if __name__ == "__main__":

@@ -14,7 +14,11 @@ ones collapse, because the useful manual read is "why did the good one rank 7th
 under dense and 1st under dense_rerank", not 40 paragraphs of StatPearls.
 
 Self-contained HTML (inline CSS, no JS needed to read it, no CDN) so a report
-opens from `file://` on a laptop with the network off.
+opens from `file://` on a laptop with the network off. `--serve` reuses the same
+renderers: `render_main` is the body both paths share, and the live shell
+(`render_html(..., live=True)` + `render_toolbar` + `PAGE_JS`) adds only the
+controls and the ~90 lines of JS that post back to the running process. A written
+report stays JS-free by default so the offline property above keeps holding.
 """
 
 from __future__ import annotations
@@ -22,10 +26,13 @@ from __future__ import annotations
 import html
 import textwrap
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from medical_rag.data.load_medqa import MedQAQuestion
 from medical_rag.retrieval.retriever import RetrievedChunk
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids a runtime cycle
+    from ceiling import CeilingResult
 
 from metrics import K_VALUES, cell_metrics
 from strategies import (
@@ -159,7 +166,13 @@ def build_cells(
         chunks = list(lists[method])
         source = prerank_map(method, {m: lists[m] for m in lists})
         views = [
-            _chunk_view(rank, chunk, judgments.get(chunk.chunk_id), gold, source.get(chunk.chunk_id))
+            _chunk_view(
+                rank,
+                chunk,
+                judgments.get(chunk.chunk_id),
+                gold,
+                source.get(chunk.chunk_id),
+            )
             for rank, chunk in enumerate(chunks, start=1)
         ]
         ids = [chunk.chunk_id for chunk in chunks]
@@ -200,7 +213,9 @@ def build_question_view(
     """
     lists: dict[str, list[RetrievedChunk]] = {}
     for method, chunks in grid.lists.items():
-        lists[method] = [chunk_lookup.get(c.chunk_id, c) if chunk_lookup else c for c in chunks]
+        lists[method] = [
+            chunk_lookup.get(c.chunk_id, c) if chunk_lookup else c for c in chunks
+        ]
     view = QuestionView(
         question_id=question.id,
         question=question.question,
@@ -215,11 +230,6 @@ def build_question_view(
         notes=dict(notes or {}),
         ks=tuple(ks),
     )
-    if grid.reused_variant:
-        for cell in view.cells:
-            if cell.variant == grid.reused_variant:
-                cell.reused = True
-    return view
     if grid.reused_variant:
         for cell in view.cells:
             if cell.variant == grid.reused_variant:
@@ -374,12 +384,16 @@ def render_terminal(view: QuestionView, *, max_chunks: int | None = 10) -> str:
     out.append(_wrap(view.question, width, "  "))
     for letter in sorted(view.options):
         marker = " <== GOLD" if letter == view.gold_letter else ""
-        out.append(f"  {letter}) {_wrap(view.options[letter], width - 6, '      ', first_only=True)}{marker}")
+        out.append(
+            f"  {letter}) {_wrap(view.options[letter], width - 6, '      ', first_only=True)}{marker}"
+        )
 
     out.append("")
     reform = view.reform or {}
     if reform.get("query") or reform.get("fallback"):
-        out.append(f"reformulation [{reform.get('method', '?')}]  prompt: {reform.get('prompt_source', '?')}")
+        out.append(
+            f"reformulation [{reform.get('method', '?')}]  prompt: {reform.get('prompt_source', '?')}"
+        )
         if reform.get("query"):
             out.append(_wrap(str(reform.get("query")), width, "  reform: "))
         else:
@@ -394,7 +408,11 @@ def render_terminal(view: QuestionView, *, max_chunks: int | None = 10) -> str:
         out.append(f"  (noted) reform error: {reform['error']}")
 
     out.append("")
-    header = f"{'strategy':<22}" + "".join(f"{'r@' + str(k):>6}" for k in ks) + f"{'rel':>6}{'1st':>5}  {'':<20}"
+    header = (
+        f"{'strategy':<22}"
+        + "".join(f"{'r@' + str(k):>6}" for k in ks)
+        + f"{'rel':>6}{'1st':>5}  {'':<20}"
+    )
     out.append(header)
     out.append("-" * width)
     for base in BASE_STRATEGIES:
@@ -407,12 +425,16 @@ def render_terminal(view: QuestionView, *, max_chunks: int | None = 10) -> str:
                 continue
             row = f"{base + ':' + variant:<22}"
             row += "".join(f"{_recall_at(cell, k):>6}" for k in ks)
-            fraction = (cell.metrics.get("per_k", {}).get(ks[-1], {}) or {}).get("relevant_fraction")
+            fraction = (cell.metrics.get("per_k", {}).get(ks[-1], {}) or {}).get(
+                "relevant_fraction"
+            )
             row += f"{fraction:>6.2f}" if isinstance(fraction, float) else f"{'-':>6}"
             row += f"{cell.metrics.get('first_relevant_rank') or '-':>5}"
             row += "  " + _flag(cell)
             out.append(row)
-    out.append("  HIT = gold-supporting chunk inside k;  = : reform column identical to orig; ~n: n unjudged")
+    out.append(
+        "  HIT = gold-supporting chunk inside k;  = : reform column identical to orig; ~n: n unjudged"
+    )
 
     for base in BASE_STRATEGIES:
         for variant in view.variants():
@@ -426,7 +448,11 @@ def render_terminal(view: QuestionView, *, max_chunks: int | None = 10) -> str:
                 star = "*" if chunk.gold_hit else " "
                 badge = RELEVANCE_BADGE.get(chunk.relevance, "?")
                 moved = "" if chunk.prerank is None else f"(#{chunk.prerank}->)"
-                body = chunk.content[:110].replace("\n", " ") if chunk.content else "(body not resolved)"
+                body = (
+                    chunk.content[:110].replace("\n", " ")
+                    if chunk.content
+                    else "(body not resolved)"
+                )
                 out.append(
                     f" {star}{chunk.rank:>2} {badge} {moved:<8} {chunk.title[:28]:<28} "
                     f"{'/'.join(chunk.supports_options) or '-':<4} {body}"
@@ -443,7 +469,11 @@ def render_terminal(view: QuestionView, *, max_chunks: int | None = 10) -> str:
 def _wrap(text: str, width: int, indent: str = "", *, first_only: bool = False) -> str:
     if first_only:
         return text if len(text) <= width else text[: width - 1] + "..."
-    return textwrap.fill(text or "", width=width, initial_indent=indent, subsequent_indent=indent)
+    return textwrap.fill(
+        text or "", width=width, initial_indent=indent, subsequent_indent=indent
+    )
+
+
 # --------------------------------------------------------------------------
 # markdown
 # --------------------------------------------------------------------------
@@ -516,7 +546,11 @@ def render_markdown(view: QuestionView) -> str:
     out.append("## Metrics")
     out.append("")
     variants = view.variants()
-    head = "| strategy | variant | " + " | ".join(f"recall@{k}" for k in ks) + " | rel-frac | 1st rel | unjudged |"
+    head = (
+        "| strategy | variant | "
+        + " | ".join(f"recall@{k}" for k in ks)
+        + " | rel-frac | 1st rel | unjudged |"
+    )
     out.append(head)
     out.append("|" + "---|" * (2 + len(ks) + 3))
     for base in BASE_STRATEGIES:
@@ -526,7 +560,9 @@ def render_markdown(view: QuestionView) -> str:
                 continue
             per_k = cell.metrics.get("per_k", {})
             row = f"| `{cell.label}` | {variant} | "
-            row += " | ".join("✅" if (per_k.get(k) or {}).get("recall") else "—" for k in ks)
+            row += " | ".join(
+                "✅" if (per_k.get(k) or {}).get("recall") else "—" for k in ks
+            )
             fraction = (per_k.get(ks[-1]) or {}).get("relevant_fraction")
             row += f" | {fraction:.2f} | {cell.metrics.get('first_relevant_rank') or '—'} | {cell.unjudged} |"
             out.append(row)
@@ -561,14 +597,18 @@ def render_markdown(view: QuestionView) -> str:
     out.append("## Chunk bodies (gold-supporting first)")
     out.append("")
     ordered = sorted(
-        {chunk.chunk_id: chunk for cell in view.cells for chunk in cell.chunks}.values(),
+        {
+            chunk.chunk_id: chunk for cell in view.cells for chunk in cell.chunks
+        }.values(),
         key=lambda chunk: (not chunk.gold_hit, chunk.rank),
     )
     for chunk in ordered:
         badge = RELEVANCE_BADGE.get(chunk.relevance, "?")
         star = " ⭐ gold-supporting" if chunk.gold_hit else ""
         summary = f"<code>{chunk.chunk_id}</code> — {chunk.title or '(no title)'} · {badge}{star}"
-        out.append(f"<details{' open' if chunk.gold_hit else ''}><summary>{summary}</summary>")
+        out.append(
+            f"<details{' open' if chunk.gold_hit else ''}><summary>{summary}</summary>"
+        )
         out.append("")
         out.append(chunk.content or "_body not resolved — see `chunk_source` above_")
         if chunk.reason:
@@ -591,9 +631,6 @@ def _ids(chunk_ids: Sequence[str], limit: int = 12) -> str:
         return "—"
     shown = ", ".join(f"`{chunk_id}`" for chunk_id in chunk_ids[:limit])
     return shown + (f" …(+{len(chunk_ids) - limit})" if len(chunk_ids) > limit else "")
-
-
-
 
 
 # --------------------------------------------------------------------------
@@ -684,10 +721,16 @@ def _chunk_card(chunk: ChunkView) -> str:
         if chunk.prerank is not None and chunk.prerank != chunk.rank
         else ""
     )
-    chips = " ".join(f'<span class="opts-chip">{_esc(o)}</span>' for o in chunk.supports_options)
+    chips = " ".join(
+        f'<span class="opts-chip">{_esc(o)}</span>' for o in chunk.supports_options
+    )
     why = f'<div class="why">judge: {_esc(chunk.reason)}</div>' if chunk.reason else ""
     body = chunk.content or "(body not resolved -- see chunk_source in the header)"
-    score = f' <span class="idc">{chunk.score:.4f}</span>' if isinstance(chunk.score, float) else ""
+    score = (
+        f' <span class="idc">{chunk.score:.4f}</span>'
+        if isinstance(chunk.score, float)
+        else ""
+    )
     return (
         f'<details class="chunk"{" open" if chunk.gold_hit else ""}>'
         f'<summary><span class="rank">{chunk.rank}</span>{_verdict(chunk)}{star} '
@@ -701,17 +744,23 @@ def _column(cell: CellView | None, ks: Sequence[int]) -> str:
     if cell is None:
         return '<div class="col"><h4>(no such cell in this run)</h4></div>'
     per_k = cell.metrics.get("per_k", {})
-    bits = " ".join(f'{"✓" if (per_k.get(k) or {}).get("recall") else "·"}@{k}' for k in ks)
+    bits = " ".join(
+        f"{'✓' if (per_k.get(k) or {}).get('recall') else '·'}@{k}" for k in ks
+    )
     first = cell.metrics.get("first_relevant_rank")
-    bits += f' · 1st rel {"#" + str(first) if first else "—"}'
+    bits += f" · 1st rel {'#' + str(first) if first else '—'}"
     if cell.unjudged:
         bits += f' · <span class="flag">{cell.unjudged} unjudged</span>'
-    head = f'<h4>{_esc(cell.label)} · {bits}</h4>'
-    cards = "".join(_chunk_card(chunk) for chunk in cell.chunks) or '<div class="diff">(empty)</div>'
+    head = f"<h4>{_esc(cell.label)} · {bits}</h4>"
+    cards = (
+        "".join(_chunk_card(chunk) for chunk in cell.chunks)
+        or '<div class="diff">(empty)</div>'
+    )
     if cell.reused:
         cards = (
             '<div class="diff"><span class="flag">identical to the orig column</span> — the '
-            "reformulated query equalled the question, so nothing was re-retrieved.</div>" + cards
+            "reformulated query equalled the question, so nothing was re-retrieved.</div>"
+            + cards
         )
     if cell.legacy:
         cards = (
@@ -734,7 +783,7 @@ def _reform_panel(view: QuestionView) -> str:
         fallback = (
             "<br><b>⚠ FELL BACK to the raw question</b> — the reform column <i>is</i> the "
             "orig column, so it measures nothing. Reason: "
-            f'<code>{_esc(reform.get("error") or "not recorded by this run")}</code>'
+            f"<code>{_esc(reform.get('error') or 'not recorded by this run')}</code>"
         )
     elif reform.get("error"):
         fallback = f'<br><span class="flag">noted: {_esc(reform["error"])}</span>'
@@ -783,19 +832,39 @@ def _metrics_table(view: QuestionView) -> str:
             per_k = cell.metrics.get("per_k", {})
             for k in ks:
                 hit = (per_k.get(k) or {}).get("recall")
-                row.append(f'<td class="{"hit" if hit else "miss"}">{"✓" if hit else "·"}</td>')
+                row.append(
+                    f'<td class="{"hit" if hit else "miss"}">{"✓" if hit else "·"}</td>'
+                )
             fraction = (per_k.get(last) or {}).get("relevant_fraction")
-            row.append(f'<td>{fraction:.2f}</td>' if isinstance(fraction, float) else "<td>—</td>")
+            row.append(
+                f"<td>{fraction:.2f}</td>"
+                if isinstance(fraction, float)
+                else "<td>—</td>"
+            )
             first = cell.metrics.get("first_relevant_rank")
-            row.append(f'<td>{"#" + str(first) if first else "—"}</td>')
+            row.append(f"<td>{'#' + str(first) if first else '—'}</td>")
         if len(variants) > 1:
-            orig = (cells.get("orig").metrics.get("per_k", {}).get(last) or {}).get("recall") if cells.get("orig") else None
-            reform_hit = (cells.get("reform").metrics.get("per_k", {}).get(last) or {}).get("recall") if cells.get("reform") else None
+            orig = (
+                (cells.get("orig").metrics.get("per_k", {}).get(last) or {}).get(
+                    "recall"
+                )
+                if cells.get("orig")
+                else None
+            )
+            reform_hit = (
+                (cells.get("reform").metrics.get("per_k", {}).get(last) or {}).get(
+                    "recall"
+                )
+                if cells.get("reform")
+                else None
+            )
             if orig is None or reform_hit is None:
                 row.append("<td>—</td>")
             else:
                 mark = "same" if orig == reform_hit else ("+1" if reform_hit else "−1")
-                css = "delta-up" if mark == "+1" else "delta-down" if mark == "−1" else ""
+                css = (
+                    "delta-up" if mark == "+1" else "delta-down" if mark == "−1" else ""
+                )
                 row.append(f'<td class="{css}">{mark}</td>')
         row.append("</tr>")
         rows.append("".join(row))
@@ -813,7 +882,7 @@ def _diff_line(orig: CellView | None, other: CellView | None) -> str:
         return '<div class="diff">identical sets (order may still differ)</div>'
     return (
         f'<div class="diff">only in <b>orig</b> ({len(only_orig)}): {_esc(", ".join(only_orig[:10]) or "—")}'
-        f'<br>only in <b>reform</b> ({len(only_other)}): {_esc(", ".join(only_other[:10]) or "—")}</div>'
+        f"<br>only in <b>reform</b> ({len(only_other)}): {_esc(', '.join(only_other[:10]) or '—')}</div>"
     )
 
 
@@ -838,7 +907,10 @@ def _question_section(view: QuestionView) -> str:
         other = view.cell(f"{base}__reform")
         if orig is None and other is None:
             continue
-        block = [f'<h4 style="margin:14px 0 4px"><code>{_esc(base)}</code></h4>', '<div class="grid">']
+        block = [
+            f'<h4 style="margin:14px 0 4px"><code>{_esc(base)}</code></h4>',
+            '<div class="grid">',
+        ]
         if "orig" in variants:
             block.append(_column(orig, view.ks))
         if "reform" in variants:
@@ -846,13 +918,13 @@ def _question_section(view: QuestionView) -> str:
         block.append("</div>")
         block.append(_diff_line(orig, other))
         blocks.append("".join(block))
-    single = ' one' if len(variants) < 2 else ""
+    single = " one" if len(variants) < 2 else ""
     return (
         f'<section class="q" id="q-{_esc(view.question_id)}">'
         f'<h2>q{_esc(view.question_id)} · <span class="gold">gold {_esc(view.gold_letter)}: '
         f"{_esc(view.gold_text)}</span> <span class='idc'>{_esc(view.split)}</span></h2>"
         f'<div class="qtext">{_esc(view.question)}</div><ol class="opts">{options}</ol>'
-        f'{_reform_panel(view)}{_metrics_table(view)}'
+        f"{_reform_panel(view)}{_metrics_table(view)}"
         f'<table class="meta">{meta_rows}{note_rows}</table>'
         + "".join(blocks).replace('class="grid"', f'class="grid{single}"')
         + "</section>"
@@ -921,33 +993,29 @@ def render_summary_table(views: Sequence[QuestionView]) -> str:
         for k in ks:
             per_k = entry["per_k"][k]
             row += f"<td>{per_k['recall']:.2f}</td><td>{per_k['rel']:.2f}</td>"
-        row += f"<td>{entry['n']}</td><td>{entry['mean_first_relevant'] or '—'}</td></tr>"
+        row += (
+            f"<td>{entry['n']}</td><td>{entry['mean_first_relevant'] or '—'}</td></tr>"
+        )
         rows.append(row)
     return f"<h3>Across these {len(views)} question(s)</h3><table class='metrics'>{''.join(head)}{''.join(rows)}</table>"
 
 
-def render_html(
-    views: Sequence[QuestionView],
-    *,
-    title: str = "Retrieval inspection",
-    meta: Mapping[str, Any] | None = None,
+def render_main(
+    views: Sequence[QuestionView], *, meta: Mapping[str, Any] | None = None
 ) -> str:
-    """One self-contained HTML file: header, summary, then one section per question.
+    """The inside of ``<main>``: provenance table, fallback banner, summary, sections.
 
-    The header carries the provenance that makes the numbers re-runnable (index
-    hash, judge-prompt sha, k values, chunk source), and the banner counts
-    questions whose reformulation fell back -- the single fact that would have
-    stopped the first run's `reform_dense` column from being read as a result.
+    Split out of ``render_html`` so the live server can swap this one block when a
+    knob changes instead of reloading the document, which would throw away scroll
+    position and every hand-opened ``<details>``. Both the static report and the
+    live page render their body from here, so the browser can never show a layout
+    the tracked report does not have -- two renderers is how a viewer drifts from
+    the table it exists to explain (see ``strategies.py``'s docstring).
     """
     meta = dict(meta or {})
-    fallbacks = [view.question_id for view in views if (view.reform or {}).get("fallback")]
-    last_k = views[0].ks[-1] if views else 0
-    links = []
-    for view in views:
-        hit = any(
-            (cell.metrics.get("per_k", {}).get(last_k) or {}).get("recall") for cell in view.cells
-        )
-        links.append(f'<a href="#q-{_esc(view.question_id)}" class="{"hit" if hit else ""}">q{_esc(view.question_id)}</a>')
+    fallbacks = [
+        view.question_id for view in views if (view.reform or {}).get("fallback")
+    ]
     banner = ""
     if fallbacks:
         banner = (
@@ -957,21 +1025,362 @@ def render_html(
             f"{_esc(', '.join(fallbacks))}</div>"
         )
     meta_table = "".join(
-        f'<tr><td class="k">{_esc(key)}</td><td>{_esc(value)}</td></tr>' for key, value in meta.items()
+        f'<tr><td class="k">{_esc(key)}</td><td>{_esc(value)}</td></tr>'
+        for key, value in meta.items()
     )
+    if not views:
+        # A served page starts empty, and a blank window reads as a broken tool
+        # rather than "you haven't asked for a question yet". Phrased for the static
+        # case too (zero sections there is an artifact gap, and this says so).
+        return (
+            f"<table class='meta'>{meta_table}</table>"
+            "<div class='panel'><b>No question sections yet.</b> Open one: the id field above "
+            "(or <code>--question-id</code> / <code>--from-run</code> on the command line) "
+            "retrieves a grid, which costs a retrieval and not a completion -- verdicts come "
+            "from the judge cache, and unjudged chunks render as <code>?</code> rather than "
+            "as irrelevant.</div>"
+        )
     return (
-        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        f"<title>{_esc(title)}</title><style>{CSS}</style></head><body>"
-        f"<header class='page'><h1>{_esc(title)}</h1>"
-        f"<div class='idc'>{_esc(meta.get('generated', ''))}</div>"
-        f"<nav class='qs'>{''.join(links)}</nav></header><main>"
         f"<table class='meta'>{meta_table}</table>{banner}"
         f"{render_summary_table(views)}"
         + "".join(_question_section(view) for view in views)
-        + "</main></body></html>"
     )
 
 
+def render_html(
+    views: Sequence[QuestionView],
+    *,
+    title: str = "Retrieval inspection",
+    meta: Mapping[str, Any] | None = None,
+    live: bool = False,
+    toolbar: str = "",
+) -> str:
+    """One self-contained HTML file: header, summary, then one section per question.
+
+    The header carries the provenance that makes the numbers re-runnable (index
+    hash, judge-prompt sha, k values, chunk source), and the banner counts
+    questions whose reformulation fell back -- the single fact that would have
+    stopped the first run's `reform_dense` column from being read as a result.
+
+    ``live=True`` is the ``--serve`` shell: it adds the toolbar, the status line and
+    ~80 lines of dependency-free JS that posts back to the running process. Left off
+    by default so a written report keeps its "opens from `file://` with the network
+    off, no JS needed to read it" property.
+    """
+    meta = dict(meta or {})
+    last_k = views[0].ks[-1] if views else 0
+    links = []
+    for view in views:
+        hit = any(
+            (cell.metrics.get("per_k", {}).get(last_k) or {}).get("recall")
+            for cell in view.cells
+        )
+        links.append(
+            f'<a href="#q-{_esc(view.question_id)}" class="{"hit" if hit else ""}">q{_esc(view.question_id)}</a>'
+        )
+    return (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        f"<title>{_esc(title)}</title><style>{CSS}{LIVE_CSS if live else ''}</style></head><body>"
+        f"<header class='page'><h1>{_esc(title)}</h1>"
+        f"<div class='idc'>{_esc(meta.get('generated', ''))}</div>"
+        f"<nav class='qs'>{''.join(links)}</nav>"
+        f"{toolbar if live else render_nav_note(views)}"
+        "</header>"
+        f"{render_probe_panel() if live else ''}"
+        f"<main id='main'>{render_main(views, meta=meta)}</main>"
+        + (f"<script>{PAGE_JS}</script>" if live else "")
+        + "</body></html>"
+    )
 
 
+def render_nav_note(views: Sequence[QuestionView]) -> str:
+    """Static reports get a one-line count so a 2-question probe is not mistaken
+    for the 20-question run when someone opens the file weeks later."""
+    if not views:
+        return "<nav class='qs'><i>no questions in this report</i></nav>"
+    return f"<nav class='qs'><i>{len(views)} question(s) · static snapshot</i></nav>"
 
+
+def render_probe_panel() -> str:
+    """Empty mount point for ceiling-probe results, outside ``<main>``.
+
+    Deliberately not inside ``<main>``: a probe is a different measurement than the
+    grid (it searches with the gold answer in the query), and letting a later grid
+    re-render sweep the probe away would be the same class of error as the
+    unlabelled ``reform_dense`` column -- a reader sees a stale number, or loses one
+    they were reading, with nothing saying so.
+    """
+    return (
+        "<div id='probe' class='probe' hidden>"
+        "<div class='probe-head'><b>Corpus ceiling probe</b> "
+        "<span class='flag'>uses the gold answer -- a diagnostic ceiling, not a retrieval lever</span> "
+        "<button type='button' class='close' onclick=\"document.getElementById('probe').hidden=true\">×</button></div>"
+        "<div id='probe-body'></div></div>"
+    )
+
+
+def render_toolbar(state: Mapping[str, Any]) -> str:
+    """The live control bar -- current knobs in, re-rendered grid out.
+
+    Every field is pre-filled from the server's *actual* knobs rather than a
+    hardcoded default, because the whole point of the server is that the knobs
+    drift from the config during a session, and a control bar that lies about its
+    own state is worse than no control bar. Buttons that cannot work in this
+    session (no retriever, no judge) render disabled with the reason in `title`,
+    not hidden -- an absent control reads like "this tool has no such feature",
+    which is how people end up re-running the CLI to find out.
+    """
+    retrieval = bool(state.get("retrieval_enabled"))
+    judge = bool(state.get("judge_enabled"))
+    unjudged = int(state.get("unjudged") or 0)
+    why_retrieval = (
+        "" if retrieval else " this session loaded no retriever (--no-retrieve)"
+    )
+    why_judge = "" if judge else " this session has no judge endpoint (--no-judge)"
+
+    def disabled(ok: bool) -> str:
+        return "" if ok else " disabled"
+
+    options = "".join(f'<option value="{_esc(q)}">' for q in state.get("questions", []))
+    probe_default = _esc(state.get("probe_default", ""))
+    return (
+        "<div class='bar'>"
+        "<div class='f'><label>question id · "
+        f"{len(state.get('questions', []))} suggested, {state.get('in_split', '?')} in split</label>"
+        "<input id='q-id' list='qids' class='num' value='"
+        f"{_esc(state.get('question_id', ''))}' data-enter='inspect' placeholder='1312' "
+        "title='the dropdown is the pinned sample; any id in the split works'>"
+        f"<datalist id='qids'>{options}</datalist></div>"
+        "<div class='f'><label>information-need override (the reform column)</label>"
+        f"<input id='query' class='wide' data-enter='inspect' value='{_esc(state.get('query', ''))}'"
+        " placeholder='blank = let the reformulator write it'></div>"
+        f"<button type='button' onclick='rag.inspect()'{disabled(retrieval)}"
+        f" title='retrieve the 5x2 grid, verdicts from cache, 0 completions{why_retrieval}'>Retrieve</button>"
+        f"<button type='button' class='alt' onclick='rag.clearOverride()' title='drop the override'>{chr(215)}</button>"
+        "<span class='sep'></span>"
+        "<div class='f'><label>top_k</label>"
+        f"<input id='top-k' class='num' data-enter='knobs' value='{_esc(state.get('top_k', ''))}'></div>"
+        "<div class='f'><label>rerank_k</label>"
+        f"<input id='rerank-k' class='num' data-enter='knobs' value='{_esc(state.get('rerank_k', ''))}'></div>"
+        "<div class='f'><label>bm25_k</label>"
+        f"<input id='bm25-k' class='num' data-enter='knobs' value='{_esc(state.get('bm25_top_k', ''))}'"
+        " title='deeper BM25 does not fix vocabulary — check bm25__orig first relevant rank'></div>"
+        "<div class='f'><label>rerank sees</label>"
+        "<select id='rerank-k-with' data-enter='knobs'>"
+        + "".join(
+            f"<option value='{variant}'{' selected' if state.get('rerank_with') == variant else ''}>"
+            f"{variant}</option>"
+            for variant in ("question", "reform")
+        )
+        + "</select></div>"
+        "<div class='f'><label>k values</label>"
+        f"<input id='ks' data-enter='knobs' value='{_esc(state.get('ks', ''))}'></div>"
+        f"<button type='button' class='alt' onclick='rag.knobs()'{disabled(retrieval)}"
+        f" title='apply and re-retrieve{why_retrieval}'>Apply</button>"
+        "<span class='sep'></span>"
+        f"<button type='button' onclick='rag.judge()' data-unjudged='{unjudged}'{disabled(judge and retrieval)}"
+        f" title='spend completions to grade the {unjudged} chunk(s) with no cached verdict{why_judge}'>"
+        f"Judge unseen ({unjudged})</button>"
+        "<span class='sep'></span>"
+        "<div class='f'><label>corpus ceiling probe · gold answer / free text</label>"
+        f"<input id='probe-text' class='wide' data-enter='probe' value='{probe_default}'"
+        " title='searches the whole corpus with this text; uses gold information, so it is a ceiling, not a lever'></div>"
+        "<button type='button' class='alt' onclick='rag.probe()'>Probe</button>"
+        "<span class='sep'></span>"
+        "<button type='button' class='alt' onclick='rag.report()' title='write report.html + rows + sidecar for this session'>Save</button>"
+        "</div>"
+        "<div id='status' class='status'></div>"
+    )
+
+
+def render_ceiling(result: "CeilingResult") -> str:
+    """One probe's result as the panel body, oracle warning first.
+
+    The warning leads rather than trails: the failure mode this guards against is
+    a reader (including future-you, pasting into `FINDINGS.md`) skimming the count
+    and the rank table and missing the line that says the query contained the gold
+    answer. The `best rank` row is the actual finding -- a strategy that cannot
+    surface the literal answer when searched *with* the literal answer has an
+    indexing problem, not a phrasing one, and no reformulation fixes that.
+    """
+    head = (
+        f"<div><b>query</b> <code>{_esc(result.query)}</code> "
+        f"<span class='idc'>{result.corpus_chunks:,} chunks scanned · {result.elapsed_ms} ms</span></div>"
+        f"<div class='flag'>{_esc(result.label)}</div>"
+    )
+    count = (
+        f"<div><b>{result.matches:,}</b> of {result.corpus_chunks:,} chunks contain it verbatim"
+        + (
+            f" <span class='idc'>(showing {len(result.hits)}; this is a sample, not a census)</span>"
+            if result.truncated
+            else ""
+        )
+        + "</div>"
+    )
+    warning = (
+        f"<div class='panel warn'>{_esc(result.warning)}</div>"
+        if result.warning
+        else ""
+    )
+
+    rows = []
+    for method in result.best_rank:
+        rank = result.best_rank[method]
+        cells = f"<td class='{'hit' if rank else 'miss'}'>{'#' + str(rank) if rank else '—'}</td>"
+        rows.append(
+            f"<tr><td style='text-align:left'><code>{_esc(method)}</code></td>{cells}"
+            f"<td>{result.surfaced.get(method, 0)}</td></tr>"
+        )
+    table = (
+        "<table class='metrics'><tr><th rowspan='2'>strategy</th>"
+        "<th colspan='2'>searched with the gold text</th></tr>"
+        "<tr><th>best rank</th><th># shown</th></tr>" + "".join(rows) + "</table>"
+        if rows
+        else ""
+    )
+    verdict = ""
+    if result.matches and all(rank is None for rank in result.best_rank.values()):
+        verdict = (
+            "<div class='panel warn'><b>The corpus states it, retrieval will not find it.</b> "
+            f"{result.matches:,} chunks contain this wording, and not one reached the top "
+            f"{max((len(c) for c in result.lists.values()), default=0)} under any strategy. "
+            "No query-side lever -- reformulation, k, reranking -- can win this question.</div>"
+        )
+
+    cards = "".join(
+        f"<details class='chunk'><summary><span class='title'>{_esc(hit.title or '(no title)')}</span> "
+        f"<span class='idc'>{_esc(hit.chunk_id)} · offset {hit.offset}</span></summary>"
+        f"<div class='body'>{_esc(hit.excerpt)}</div></details>"
+        for hit in result.hits
+    )
+    return head + count + warning + table + verdict + cards
+
+
+LIVE_CSS = """
+header.page { padding-bottom: 6px; }
+.bar { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: flex-end;
+       margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--line); font-size: 12px; }
+.bar .f { display: flex; flex-direction: column; gap: 2px; }
+.bar label { color: #666; font-size: 10px; text-transform: uppercase; letter-spacing: .03em; }
+.bar input, .bar select { font: 12px/1.3 ui-monospace, monospace; padding: 3px 5px;
+       border: 1px solid var(--line); border-radius: 3px; background: #fff; }
+.bar input.wide { min-width: 320px; }
+.bar input.num { width: 56px; }
+.bar button { font: 12px/1.3 -apple-system, sans-serif; padding: 4px 9px; border-radius: 3px;
+       border: 1px solid #17181a; background: #17181a; color: #fff; cursor: pointer; }
+.bar button.alt { background: #fff; color: #17181a; }
+.bar button:disabled { opacity: .4; cursor: not-allowed; }
+.bar .sep { width: 1px; align-self: stretch; background: var(--line); margin: 0 2px; }
+.status { font-size: 11px; color: #555; font-family: ui-monospace, monospace;
+       min-height: 14px; margin-top: 4px; }
+.status.err { color: #c53030; }
+body.busy { cursor: progress; }
+body.busy main { opacity: .55; }
+.probe { margin: 0 18px; margin-top: 10px; border: 1px solid var(--gold);
+       border-left: 4px solid var(--gold); background: #fffafb; padding: 8px 10px; border-radius: 3px; }
+.probe .probe-head { font-size: 12px; margin-bottom: 4px; }
+.probe .close { float: right; border: none; background: none; color: #666; font-size: 15px; cursor: pointer; }
+.probe table.metrics { margin-top: 6px; }
+"""
+
+PAGE_JS = """
+(function () {
+  // No framework, no build step: this page's whole job is to post the current knobs
+  // to the already-loaded process and drop the re-rendered block back in. Reload
+  // is the fallback -- if a request fails the status line says so and says to
+  // reload, rather than leaving a stale grid that looks like the current one.
+  var busy = false;
+
+  function setStatus(text, isError) {
+    var el = document.getElementById('status');
+    if (el) { el.textContent = text || ''; el.className = 'status' + (isError ? ' err' : ''); }
+  }
+
+  function setBusy(on) {
+    busy = on;
+    document.body.classList.toggle('busy', on);
+    document.querySelectorAll('.bar button').forEach(function (b) { b.disabled = on; });
+  }
+
+  function value(id) { var el = document.getElementById(id); return el ? el.value.trim() : ''; }
+
+  async function post(path, body) {
+    if (busy) { setStatus('already working — wait for the current request', true); return null; }
+    setBusy(true);
+    setStatus(path + ' …');
+    try {
+      var r = await fetch(path, { method: 'POST',
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+      var text = await r.text();
+      if (!r.ok) { setStatus(text || (r.status + ' ' + r.statusText), true); return null; }
+      return text;
+    } catch (e) {
+      setStatus('request failed: ' + e + ' — the server may have exited; reload', true);
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function swapMain(html, note) {
+    if (html === null) return;
+    var main = document.getElementById('main');
+    main.innerHTML = html;
+    setStatus(note || 'ok');
+  }
+
+  window.rag = {
+    inspect: function () {
+      var id = value('q-id');
+      var body = id ? { question_id: id } : {};
+      var q = value('query');
+      if (q) body.query = q;
+      return post('/api/inspect', body).then(function (h) { swapMain(h, 'retrieved (judge cache only, 0 calls)'); });
+    },
+    clearOverride: function () {
+      document.getElementById('query').value = '';
+      return post('/api/inspect', { query: null })
+        .then(function (h) { swapMain(h, 'override cleared — reformulator decides'); });
+    },
+    judge: function () {
+      if (!window.confirm('Judge the unjudged chunks on the current question?\\n\\nThis spends completions on the shared :8080 endpoint. Verdicts are appended to the shared judge cache, so you never pay for them twice.')) return;
+      return post('/api/judge', {}).then(function (h) { swapMain(h, 'judged — verdicts cached'); });
+    },
+    knobs: function () {
+      var body = {
+        top_k: value('top-k'), rerank_k: value('rerank-k'), bm25_top_k: value('bm25-k'),
+        rerank_with: value('rerank-k-with'), ks: value('ks')
+      };
+      return post('/api/knobs', body).then(function (h) { swapMain(h, 'knobs applied + re-retrieved'); });
+    },
+    probe: function () {
+      var text = value('probe-text');
+      if (!text) { setStatus('type some text to probe the corpus with', true); return; }
+      return post('/api/probe', { text: text }).then(function (r) {
+        if (r === null) return;
+        var box = document.getElementById('probe');
+        document.getElementById('probe-body').innerHTML = r;
+        box.hidden = false;
+        box.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        setStatus('probe done (no completions spent)');
+      });
+    },
+    report: function () {
+      return post('/api/report', {}).then(function (r) {
+        if (r !== null) setStatus('wrote ' + r);
+      });
+    }
+  };
+
+  document.addEventListener('keydown', function (e) {
+    // Enter in any toolbar field runs that field's action, so the whole loop is
+    // type-then-Enter and never needs the mouse.
+    if (e.key === 'Enter' && e.target && e.target.matches && e.target.matches('.bar input')) {
+      var name = e.target.dataset.enter || 'inspect';
+      if (!window.rag[name]) return;
+      e.preventDefault();
+      window.rag[name]();
+    }
+  });
+})();
+"""

@@ -174,6 +174,92 @@ the same strategy's other query column.
   `context.md`. The first `--from-run` run on a pre-sidecar run backfills
   `chunks.jsonl` from the index, so the index only has to be paid for once.
 
+## Serving it (`--serve`)
+
+The reading surface and the interactive surface were in different windows: the
+knobs lived in a terminal REPL that truncates chunk bodies to 110 characters (its
+own renderer says "the HTML is where you read prose"), and the prose lived in a
+`report.html` you reloaded by hand. Outside the REPL, every guess re-ran the script
+and re-paid ~40 s of embedder + cross-encoder + the 467 MB BM25 pickle to exercise
+one grid. Measured here (MPS, k=20, the five `__orig` cells): **~12 s per grid**,
+so the load is the same order as the work — and `--serve` pays it once per session
+instead of once per guess. Note that `inspect_retrieval.py`'s `Inspector` docstring
+still claims "~2 s", which is roughly what a `--query` override on a warm process
+costs before the rerank passes, not what a full grid costs.
+
+`--serve` keeps that loaded state behind a localhost form:
+
+```bash
+# the full interactive grid (loads models + BM25, no endpoint until you click Judge)
+.venv/bin/python experiments/retrieval_tuning/inspect_retrieval.py --serve
+
+# browse an already-judged run's verdicts with nothing loaded at all
+.venv/bin/python experiments/retrieval_tuning/inspect_retrieval.py --serve --no-retrieve \
+    --from-run outputs/exploration/retrieval_tuning/grid_smoke_check
+
+.venv/bin/python experiments/retrieval_tuning/inspect_retrieval.py --serve --dry-run  # route table
+```
+
+`serve.py` builds no second renderer: the page body is `render.render_main`, the
+same function the static `report.html` is built from, and every route calls
+`aretrieve_grid` / `ensure_verdicts` / `build_cells`. `--serve --dry-run` prints the
+route table; `--port 0` binds a free port so two hypotheses can be compared in two
+browsers, each with its own loaded index.
+
+Constraints worth knowing before changing it:
+
+- **Judging is a button, never a page load.** `Retrieve` and the knob fields make
+  zero completions and read verdicts from `judge_cache/`; only **Judge unseen (N)**
+  spends endpoint time on the shared `:8080`, and what it
+  spends lands in the append-only cache, so a question costs once, ever. Re-grading
+  re-renders the grid already in memory rather than re-inspecting, because
+  re-inspecting re-runs the reformulator -- a paid completion to re-derive a query
+  we already have, and a *different* string would silently swap the column being
+  read.
+- **One asyncio loop on its own thread**, because `LLMClient`'s `AsyncOpenAI` binds
+  to whichever loop it first runs on; handler threads post coroutines to it and
+  block. An `asyncio.Lock` serialises retrieval and judging -- the cross-encoder is
+  MPS work and all three models share one oMLX process (PLAN.md, ADR-0005), so two
+  tabs firing at once buys contention and a misread, not speed.
+- **A rejected knob changes nothing.** `rerank_k` above `top_k` passes both bounds
+  and is still nonsense, so validation is a full pass before any assignment; a
+  half-applied pair would leave the running server retrieving with a combination it
+  just refused.
+- **One view per question per session.** `Inspector.inspect()` appends (right for
+  the REPL); a page you can hit Refresh on must replace, because
+  `render.aggregate_views` averages over the view list and five Retrieve clicks
+  would report `n=5` for one question.
+- Localhost, no auth. It renders full corpus text and can spend endpoint time; do
+  not repoint it at `0.0.0.0`.
+
+### The corpus ceiling probe
+
+The box labelled *corpus ceiling probe* is the one thing here that answers a
+question the judge harness cannot: the harness only grades chunks it already
+retrieved, so it cannot separate **"the supporting chunk exists and retrieval
+ranked it #60"** from **"StatPearls never contained it."** `dense__orig` sits at
+40/55/65 recall@5/10/20, so roughly a third of the pinned 20 is in one of those two
+states and `FINDINGS.md` is silent on which -- and only the first is winnable by
+reformulation, k, or a reranker.
+
+It runs the gold option's own wording two ways (`ceiling.py`), spending no
+completions: a literal scan over all 380,454 chunk bodies already in memory in the
+BM25 pickle, and `strategies.retrieve_base()` with that wording as the query. If a
+query that *contains* the answer cannot surface a chunk that *contains* it, the
+bottleneck is the index.
+
+**It is a ceiling, not a lever.** It uses the gold answer, so it must never be
+cited as a strategy's score -- every result carries that label into the rendered
+panel and `probes.jsonl`, and `probes.jsonl` is never merged into `FINDINGS.md`.
+This directory has already published a wrong number off an unlabelled column
+(`reform_dense`, +5pp recall@20 from a rewrite that fell back on 18/20 questions).
+
+And the bound is one-directional: **0 matches means "not stated in these words,"
+not "not in StatPearls."** Phase 8 found 32/40 rows chose wording appearing nowhere
+in their excerpts -- these models answer from understanding, so a paraphrased answer
+can be fully supported by chunks a literal scan cannot see. Treat a miss as a hint
+about wording, never as evidence of absence.
+
 ## What the first run (2026-09-29) actually showed
 
 `FINDINGS.md` as committed reported `reform_dense` as a peer method and read

@@ -14,6 +14,13 @@ plausible result computed from the wrong input -- rather than arithmetic:
   makes zero calls (`load_cache`, `ensure_verdicts`, `judge_prompt_sha`)
 * a chunk with no verdict is rendered as unmeasured, never as `irrelevant`
   (`build_cells`, `metrics`)
+* the ceiling probe cannot be mistaken for a retrieval lever -- it carries its
+  oracle label into the render, and a literal miss reads as "not stated in these
+  words", never as "absent from the corpus" (`ceiling`, `render_ceiling`)
+* the served page renders from the same `render_main` as the written report, spends
+  no completion and no re-retrieval to re-grade a grid, keeps one view per question
+  so `aggregate_views` counts questions rather than clicks, and answers a bad knob
+  with a 400 rather than a 200 holding a traceback (`serve`, `render`)
 
 The experiment modules import each other by bare name (`from strategies import
 ...`), the way `scripts/exploration/` does, so the directory goes on `sys.path`
@@ -23,7 +30,11 @@ packages, and they are not meant to be importable from `src/`.
 
 import asyncio
 import json
+import re
 import sys
+import threading
+import time
+import types
 from pathlib import Path
 
 import pytest
@@ -33,12 +44,14 @@ _EXP = _REPO / "experiments" / "retrieval_tuning"
 if str(_EXP) not in sys.path:
     sys.path.insert(0, str(_EXP))
 
+import ceiling  # noqa: E402
 import chunk_store  # noqa: E402
 import judge_cache  # noqa: E402
 import judge_prompt  # noqa: E402
 import metrics  # noqa: E402
 import reformulate  # noqa: E402
 import render  # noqa: E402
+import serve  # noqa: E402
 import strategies  # noqa: E402
 from medical_rag.data.load_medqa import MedQAQuestion  # noqa: E402
 from medical_rag.retrieval.retriever import RetrievedChunk  # noqa: E402
@@ -803,6 +816,494 @@ def test_rerender_stops_on_a_run_it_cannot_read(tmp_path: Path) -> None:
         with pytest.raises(SystemExit) as excinfo:
             asyncio.run(judge_harness.amain(_rerender_args(run, tmp_path / "f.md")))
         assert expect in str(excinfo.value)
+
+
+# --- the corpus ceiling probe --------------------------------------------------
+#
+# The judge harness grades chunks it chose itself, so it cannot separate "not
+# retrieved" from "not in StatPearls" -- and `FINDINGS.md`'s 65% recall@20 means a
+# third of the pinned sample sits in one of those two buckets with no way to say
+# which. These tests pin the two things that make the probe trustworthy rather than
+# merely impressive: it never lets a reader forget that its query contained the
+# gold answer, and a literal miss comes back as "not stated in these words", never
+# as "absent from the corpus".
+
+
+class FakeCorpus:
+    """The BM25 index's shape: parallel id/title/content lists, plus `search()`.
+
+    `ceiling` reads `.contents` for the scan and `retrieve_base` calls `.search()`,
+    so one small object stands in for the 467 MB pickle and the whole probe is
+    testable without loading a model or touching LanceDB.
+    """
+
+    def __init__(self, bodies: dict[str, str]) -> None:
+        self.chunk_ids = list(bodies)
+        self.titles = [f"title of {cid}" for cid in bodies]
+        self.contents = [bodies[cid] for cid in bodies]
+        self._by_id = dict(bodies)
+        self.calls: list[tuple[str, int]] = []
+
+    def search(self, query: str, k: int) -> list[RetrievedChunk]:
+        self.calls.append((query, k))
+        return [chunk(cid, body=self._by_id[cid], score=float(k - i)) for i, cid in enumerate(self.chunk_ids[:k])]
+
+
+def test_containment_scan_counts_every_match_but_shows_only_a_sample() -> None:
+    index = FakeCorpus(
+        {
+            "a": "Chronic pancreatitis causes steatorrhea.",
+            "b": "no mention here",
+            "c": "chronic PANCREATITIS is the answer",  # case-insensitive on purpose
+        }
+    )
+    scan = ceiling.containment_scan(index, "chronic pancreatitis", limit=10)
+    assert scan.matches == 2, "the census is case-insensitive and covers every chunk, not the first page"
+    assert len(scan.hits) == 2 and not scan.truncated
+    assert scan.ids == {"a", "c"}
+
+    scan = ceiling.containment_scan(index, "chronic pancreatitis", limit=1)
+    assert (scan.matches, len(scan.hits), scan.truncated) == (2, 1, True), (
+        "a 1-hit list must be labelled a sample -- otherwise 'showing 1' reads as 'only 1 exists'"
+    )
+    assert scan.ids == {"a", "c"}, "the census survives a truncated display"
+
+
+def test_a_chunk_matching_twice_counts_once_in_the_census() -> None:
+    # 278 chunks say "CT angiography"; two of them saying it five times each is not
+    # 288. The number on the page is a count of chunks.
+    scan = ceiling.containment_scan(FakeCorpus({"a": "beta ... beta ... beta"}), "beta")
+    assert (scan.matches, len(scan.hits)) == (1, 1)
+
+
+def test_best_rank_scores_against_every_match_not_just_the_displayed_sample() -> None:
+    # Found by running the probe against the real corpus: "CT angiography" matches 278
+    # chunks and the scan shows 20, so scoring `best_rank` against the sample reported
+    # "the corpus states it, retrieval will not find it" for chunks retrieval had
+    # surfaced. Here the sample is one hit and the chunk retrieval finds is a different
+    # one -- the same bug at a size a test can assert on.
+    bodies = {"x1": "alpha", "x2": "alpha", "m1": "beta", "m2": "beta", "m3": "beta"}
+    corpus = FakeCorpus(bodies)
+
+    class PointRetriever:
+        def retrieve(self, query: str, k: int) -> list[RetrievedChunk]:
+            return [chunk("m3"), chunk("x1")][:k]
+
+        def rerank(self, query: str, chunks, k: int) -> list[RetrievedChunk]:
+            return list(chunks)[:k]
+
+    result = ceiling.probe("beta", PointRetriever(), corpus, top_k=2, rerank_k=1, limit=1)
+    assert (result.matches, len(result.hits)) == (3, 1)
+    assert result.best_rank["dense"] == 1, "m3 matched and ranked #1; the sample only showed m1"
+    assert result.surfaced["dense"] == 1
+    assert result.best_rank["bm25"] is None, "bm25 got x1/x2, neither of which states it"
+    page = render.render_ceiling(result)
+    assert "retrieval will not find it" not in page, (
+        "that verdict must not fire when a strategy did surface a matching chunk"
+    )
+
+
+def test_containment_scan_refuses_a_needle_too_short_to_mean_anything() -> None:
+    # `be` matches a large fraction of English medical prose; returning a count for
+    # it would look like a finding about where an answer is stated.
+    with pytest.raises(ValueError, match="at least"):
+        ceiling.containment_scan(FakeCorpus({"a": "beta"}), "be")
+
+
+def test_the_probe_labels_itself_oracle_everywhere_a_reader_might_stop() -> None:
+    result = ceiling.probe(
+        "beta", FakeRetriever(), FakeCorpus({"c1": "beta disease", "c2": "other"}),
+        top_k=2, rerank_k=2,
+    )
+    assert "NOT a retrieval lever" in result.label
+    assert result.to_dict()["oracle"] is True
+    page = render.render_ceiling(result)
+    assert "NOT a retrieval lever" in page, "the label must be on the page, not only in the data"
+    assert result.query == "beta" and result.corpus_chunks == 2
+
+
+def test_the_probe_names_the_case_where_no_query_side_lever_can_win() -> None:
+    # `zz9` states the answer but is never returned by either retriever, which is
+    # the finding that should end a reformulation effort rather than start one.
+    corpus = FakeCorpus({"c1": "alpha", "c2": "gamma", "zz9": "beta is correct"})
+
+    def never_returns_zz9(query: str, k: int) -> list[RetrievedChunk]:
+        return [chunk("c1"), chunk("c2")][:k]
+
+    retriever = FakeRetriever()
+    retriever.retrieve = never_returns_zz9  # type: ignore[assignment]
+    retriever.rerank = lambda q, chunks, k: list(chunks)[:k]  # type: ignore[assignment]
+    result = ceiling.probe("beta", retriever, corpus, top_k=2, rerank_k=2)
+
+    assert result.matches == 1
+    assert set(result.best_rank) == set(result.lists)
+    assert all(rank is None for rank in result.best_rank.values())
+    page = render.render_ceiling(result)
+    assert "retrieval will not find it" in page
+    assert "reformulation" in page, "the page must say what this rules out, not just the number"
+
+
+def test_a_literal_miss_is_reported_as_wording_not_absence() -> None:
+    # Phase 8: most correct answers chose wording found nowhere in the excerpts, so
+    # 0 literal matches cannot mean "StatPearls lacks it" or the probe would
+    # over-claim and kill a phase that could still have won.
+    result = ceiling.probe(
+        "duct obstruction", FakeRetriever(), FakeCorpus({"c1": "beta disease"}), top_k=1, rerank_k=1
+    )
+    assert result.matches == 0
+    assert "paraphras" in result.warning.lower()
+    assert "not proof" in result.warning.lower()
+
+
+def test_best_ranks_reports_absence_for_every_strategy_not_an_empty_row() -> None:
+    ranks, counts = ceiling.best_ranks({"dense": [chunk("c1"), chunk("c2")]}, set())
+    assert ranks == {"dense": None} and counts == {"dense": 0}
+    ranks, counts = ceiling.best_ranks({"dense": [chunk("c1"), chunk("c2")]}, {"c2"})
+    assert ranks == {"dense": 2} and counts == {"dense": 1}
+
+
+# --- the served page and the static report share one renderer -------------------
+
+
+def test_render_main_is_exactly_what_render_html_puts_inside_main() -> None:
+    # The live page swaps this block, so if the two ever diverge the browser shows a
+    # layout the tracked report does not have -- and the report is what FINDINGS.md
+    # is written from.
+    view = render.build_question_view(question(), _sample_grid(), {}, split="train", ks=(2, 4))
+    body = render.render_main([view], meta={"top_k": "6"})
+    page = render.render_html([view], meta={"top_k": "6"})
+    start, end = page.index("<main id='main'>") + len("<main id='main'>"), page.index("</main>")
+    assert page[start:end] == body
+
+
+def test_a_written_report_still_needs_no_javascript_to_read() -> None:
+    view = render.build_question_view(question(), _sample_grid(), {}, split="train", ks=(2, 4))
+    static = render.render_html([view])
+    assert "<script" not in static and "class='bar'" not in static
+    live = render.render_html(
+        [view],
+        live=True,
+        toolbar=render.render_toolbar({"retrieval_enabled": True, "judge_enabled": True}),
+    )
+    assert "<script" in live and "class='bar'" in live
+
+
+def test_the_toolbar_shows_the_servers_knobs_and_disables_what_cannot_work() -> None:
+    state = {
+        "question_id": "42", "query": "REWRITE me", "top_k": 30, "rerank_k": 7,
+        "bm25_top_k": 400, "rerank_with": "reform", "ks": "5 10 20",
+        "retrieval_enabled": False, "judge_enabled": False, "unjudged": 12,
+        "questions": ["42", "43"], "in_split": 10178, "probe_default": "beta", "cached": 99,
+    }
+    bar = render.render_toolbar(state)
+    for expected in ("value='30'", "value='7'", "value='400'", "value='5 10 20'", "REWRITE me", "beta"):
+        assert expected in bar, f"the toolbar must show the knobs actually in force, not defaults: {expected}"
+    assert "2 suggested, 10178 in split" in bar, "the field must say it accepts more than it suggests"
+    assert "value='reform' selected" in bar
+    assert bar.count("disabled") >= 3, "no retriever means no Retrieve, no Apply and no Judge"
+    assert "--no-retrieve" in bar, "a disabled control has to say why, or it reads as a missing feature"
+    assert "Judge unseen (12)" in bar
+
+
+# --- the served session: cost discipline and one view per question --------------
+
+
+_CHUNK_ID_IN_PROMPT = re.compile(r"chunk_id=(\S+)")
+
+
+class FakeJudgeClient:
+    """Stand-in for `LLMClient` on the judge path; grades every id the prompt names.
+
+    Reading ids out of the prompt rather than being handed them is deliberate:
+    `ensure_verdicts` joins verdicts back by `chunk_id`, so a prompt that stopped
+    printing them would silently leave every chunk unjudged. This fake makes that a
+    test failure instead of a run of question marks.
+    """
+
+    def __init__(self, *, relevance: str = "relevant", supports: tuple[str, ...] = ("B",)) -> None:
+        self.config = types.SimpleNamespace(name="fake_judge")
+        self.calls = 0
+        self._relevance = relevance
+        self._supports = list(supports)
+
+    async def agenerate_structured(self, prompt, output_type, *, system_prompt=None):
+        self.calls += 1
+        ids = _CHUNK_ID_IN_PROMPT.findall(prompt)
+        if not ids:
+            raise AssertionError("judge prompt names no chunk_id -- verdicts cannot be joined back")
+        return judge_prompt.JudgeVerdict(
+            judgments=[
+                judge_prompt.ChunkJudgment(
+                    chunk_id=cid,
+                    relevance=self._relevance,
+                    supports_options=self._supports,
+                    reason=f"graded {cid}",
+                )
+                for cid in ids
+            ]
+        )
+
+
+class FakeInspector:
+    """Only the surface `serve.Backend` touches, with no models behind any of it.
+
+    Everything the server would cost to test -- embedder, cross-encoder, the BM25
+    pickle, a completion from the judge endpoint -- is the same FakeRetriever /
+    FakeBM25 pair the grid tests use, so the loop bridge and all nine routes are
+    exercisable offline.
+    """
+
+    def __init__(self, *, out_dir: Path, cache_path: Path, ks: tuple[int, ...] = (2, 4)) -> None:
+        self.args = types.SimpleNamespace(judge_cache=cache_path, judge_batch=24)
+        self.out_dir = out_dir
+        self.split = "train"
+        self.top_k, self.rerank_k, self.bm25_top_k = 6, 3, 6
+        self.rerank_with = "question"
+        self.ks = ks
+        self.cache: dict[tuple[str, str], dict] = {}
+        self.cache_counts = {"loaded": 0, "stale_prompt": 0, "malformed": 0}
+        self.retriever, self.bm25 = FakeRetriever(), FakeBM25()
+        self.judge: FakeJudgeClient | None = None
+        self.judge_model = types.SimpleNamespace(name="fake_judge")
+        self.breaker = None
+        self.table = None
+        self.judge_sha = judge_prompt.judge_prompt_sha()
+        self.views: list[render.QuestionView] = []
+        self.opened: dict[str, bool] = {}
+        self.closed = False
+        self.inspections = 0
+
+    async def open(self, *, retrieval: bool, judge: bool) -> None:
+        self.opened = {"retrieval": retrieval, "judge": judge}
+
+    async def close(self) -> None:
+        self.closed = True
+
+    def meta(self, extra: dict | None = None) -> dict:
+        return {"mode": "fake", **({"extra": extra} if extra else {})}
+
+    async def inspect(self, question: MedQAQuestion, *, query_override: str | None = None):
+        self.inspections += 1
+        grid = strategies.retrieve_grid(
+            question.question, self.retriever, self.bm25,
+            reformulated_text=query_override, top_k=self.top_k, rerank_k=self.rerank_k,
+            rerank_with=self.rerank_with,
+        )
+        judgments = {
+            c.chunk_id: self.cache[(question.id, c.chunk_id)]
+            for c in grid.all_chunks().values()
+            if (question.id, c.chunk_id) in self.cache
+        }
+        view = render.build_question_view(question, grid, judgments, split=self.split, ks=self.ks)
+        self.views.append(view)
+        return view
+
+
+def _backend(tmp_path: Path, *, judged: bool = False) -> serve.Backend:
+    insp = FakeInspector(out_dir=tmp_path, cache_path=tmp_path / "cache.jsonl")
+    if judged:
+        insp.judge = FakeJudgeClient()
+    backend = serve.Backend(insp, {question().id: question()})
+    backend.start()
+    return backend
+
+
+def test_reinspecting_replaces_the_view_so_a_summary_counts_questions_not_clicks(tmp_path) -> None:
+    # `Inspector.inspect` appends -- right for the REPL, wrong for a page you can
+    # hit Refresh on. `aggregate_views` averages over the view list, so five clicks
+    # would print n=5 and report one question's recall as five.
+    backend = _backend(tmp_path)
+    q = question()
+    for _ in range(3):
+        backend.submit(backend.inspect_route({"question_id": q.id}), timeout=10)
+    assert len(backend.insp.views) == 1
+    assert len(backend.session) == 1
+    summary = render.aggregate_views(backend.insp.views)
+    assert {entry["n"] for entry in summary.values()} == {1}
+
+
+def test_judging_costs_no_retrieval_and_no_second_rewrite(tmp_path) -> None:
+    # Re-inspecting to pick up fresh verdicts would re-run the reformulator: a paid
+    # completion to re-derive a query we already hold, and a different string would
+    # silently swap the column the reader is looking at.
+    backend = _backend(tmp_path, judged=True)
+    q = question()
+    backend.submit(backend.inspect_route({"question_id": q.id}), timeout=10)
+    retrieves = len(backend.insp.retriever.retrieve_calls)
+    inspections = backend.insp.inspections
+
+    html = backend.submit(backend.judge_route({}), timeout=30)
+    assert backend.insp.judge.calls >= 1
+    assert len(backend.insp.retriever.retrieve_calls) == retrieves, "judging must not re-retrieve"
+    assert backend.insp.inspections == inspections, "judging must not re-run the reformulator"
+    assert "REL" in html
+
+    view = backend.session[q.id].view
+    assert all(chunk.judged for cell in view.cells for chunk in cell.chunks)
+    # And the verdicts are on disk, so the next session gets them for free.
+    assert (tmp_path / "cache.jsonl").exists()
+
+
+def test_the_judge_button_refuses_when_every_verdict_is_already_cached(tmp_path) -> None:
+    # "Nothing to spend" is a real answer; silently re-grading is how a cached run
+    # ends up paying for itself twice.
+    backend = _backend(tmp_path, judged=True)
+    q = question()
+    backend.submit(backend.inspect_route({"question_id": q.id}), timeout=10)
+    backend.submit(backend.judge_route({}), timeout=30)
+    calls = backend.insp.judge.calls
+    with pytest.raises(serve.HttpError) as excinfo:
+        backend.submit(backend.judge_route({}), timeout=30)
+    assert excinfo.value.status == 409
+    assert backend.insp.judge.calls == calls
+
+
+def test_a_question_id_outside_the_split_is_rejected_not_redrawn(tmp_path) -> None:
+    backend = _backend(tmp_path)
+    with pytest.raises(serve.HttpError) as excinfo:
+        backend.submit(backend.inspect_route({"question_id": "not-a-question"}), timeout=10)
+    assert excinfo.value.status == 400 and "not in split" in str(excinfo.value)
+
+
+def test_the_id_field_suggests_the_sample_but_still_accepts_any_split_id(tmp_path) -> None:
+    # The dev split is 10,178 questions. Suggesting all of them would put ~200 KB of
+    # <option> markup on every page render; restricting the field to the pinned
+    # sample would break the ad-hoc lookup that makes one odd question checkable. A
+    # datalist suggests without restricting, so both are satisfiable -- this pins
+    # that they stay that way.
+    pool = {cid: question().model_copy(update={"id": cid}) for cid in ("1312", "7777")}
+    insp = FakeInspector(out_dir=tmp_path, cache_path=tmp_path / "c.jsonl")
+    backend = serve.Backend(insp, pool, ["1312", "9999-not-in-split"])
+    backend.start()
+    assert backend.browse == ["1312"], "a suggested id outside the split is dropped, not rendered"
+    backend.submit(backend.inspect_route({"question_id": "7777"}), timeout=10)
+    assert backend.current == "7777", "an id nobody suggested must still retrieve"
+
+
+def test_knob_validation_names_the_constraint_it_hit(tmp_path) -> None:
+    backend = _backend(tmp_path)
+    backend.submit(backend.inspect_route({"question_id": question().id}), timeout=10)
+    cases = {
+        "top_k": ("0", "between 1 and 200"),
+        "rerank_k": ("nonsense", "must be an integer"),
+        "bm25_top_k": ("99999", "between 1 and 1000"),
+    }
+    for name, (value, expect) in cases.items():
+        with pytest.raises(serve.HttpError) as excinfo:
+            backend.submit(backend.knobs_route({name: value}), timeout=10)
+        assert expect in str(excinfo.value), f"{name}={value}"
+
+    # rerank_k above top_k passes both bounds and is still nonsense: the reranker
+    # would be handed nothing to reorder, which looks like a lever that did nothing.
+    with pytest.raises(serve.HttpError) as excinfo:
+        backend.submit(backend.knobs_route({"top_k": "8", "rerank_k": "9"}), timeout=10)
+    assert "nothing to reorder" in str(excinfo.value)
+    assert backend.insp.top_k == 6, "a rejected request must not leave its knobs applied"
+
+    # A metric past the retrieval depth is undefined, not zero.
+    with pytest.raises(serve.HttpError) as excinfo:
+        backend.submit(backend.knobs_route({"ks": "10 20"}), timeout=10)
+    assert "exceeds top_k" in str(excinfo.value)
+
+    # Applying a legal pair works and is reported.
+    applied = backend.submit(backend.knobs_route({"top_k": "10", "rerank_k": "4"}), timeout=10)
+    assert (backend.insp.top_k, backend.insp.rerank_k) == (10, 4)
+    assert "top_k=10" in applied
+
+
+def test_a_probe_only_session_still_persists_its_probes(tmp_path) -> None:
+    # Found by clicking Save in the running app: it refused until a question had been
+    # inspected, so a session spent probing the corpus -- a result in its own right,
+    # and the only place a ceiling measurement is recorded -- could not be written
+    # down at all.
+    insp = FakeInspector(out_dir=tmp_path, cache_path=tmp_path / "cache.jsonl")
+    insp.bm25 = FakeCorpus({"c1": "beta disease", "c2": "alpha"})
+    backend = serve.Backend(insp, {})
+    backend.start()
+
+    with pytest.raises(serve.HttpError, match="nothing to write"):
+        backend.submit(backend.report_route({}), timeout=30)
+
+    backend.submit(backend.probe_route({"text": "beta disease"}), timeout=30)
+    written = backend.submit(backend.report_route({}), timeout=30)
+    assert "probes.jsonl" in written and (tmp_path / "probes.jsonl").exists()
+    record = json.loads((tmp_path / "probes.jsonl").read_text(encoding="utf-8").strip())
+    assert record["oracle"] is True and record["matches"] == 1, "the saved row keeps its own warning"
+
+
+def test_reading_a_session_back_after_save_needs_no_endpoint(tmp_path) -> None:
+    backend = _backend(tmp_path, judged=True)
+    backend.submit(backend.inspect_route({"question_id": question().id}), timeout=10)
+    backend.submit(backend.judge_route({}), timeout=30)
+    written = backend.submit(backend.report_route({}), timeout=30)
+    for name in ("report.html", "results.jsonl", "chunks.jsonl", "context.md"):
+        assert name in written and (tmp_path / name).exists()
+    sidecar = chunk_store.read_chunks(tmp_path / "chunks.jsonl")
+    assert sidecar and all(record.content for record in sidecar.values())
+
+
+def _request(port: int, method: str, path: str, body: dict | None = None) -> tuple[int, str]:
+    import http.client
+
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    try:
+        payload = json.dumps(body) if body is not None else None
+        connection.request(method, path, body=payload, headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        return response.status, response.read().decode("utf-8")
+    finally:
+        connection.close()
+
+
+def test_the_loop_bridge_serves_pages_errors_and_all_over_real_http(tmp_path) -> None:
+    """The risky part, end to end: handler threads in, the Inspector's loop out.
+
+    `LLMClient` binds to whichever loop it first runs on, so this whole shape exists
+    to keep one loop. A unit test of `submit()` would not catch a route that blocks
+    it, a response missing `Content-Length` under HTTP/1.1, or an error path that
+    answers 200 with a traceback in the body -- and a 200-with-error is the one
+    failure that leaves a stale grid on screen looking current.
+    """
+    insp = FakeInspector(out_dir=tmp_path, cache_path=tmp_path / "cache.jsonl")
+    insp.judge = FakeJudgeClient()
+    # The probe scans `.contents`, which the BM25 pickle has and FakeBM25 does not.
+    insp.bm25 = FakeCorpus({"co1": "beta is the answer", "bo1": "alpha", "bo2": "gamma"})
+    ports: list[int] = []
+    thread = threading.Thread(
+        target=serve.serve,
+        args=(insp, {question().id: question()}),
+        kwargs={"port": 0, "on_port": ports.append, "retrieval": True, "judge": True},
+        daemon=True,  # dies with the test session; serve_forever has no other exit
+    )
+    thread.start()
+    deadline = time.time() + 15
+    while not ports and time.time() < deadline:
+        time.sleep(0.05)
+    assert ports, "the server never bound a port"
+    port = ports[0]
+
+    status, page = _request(port, "GET", "/")
+    assert status == 200 and "<main id='main'>" in page
+    assert "class='bar'" in page and "rag.inspect()" in page, "the page must actually be the live shell"
+    assert insp.opened == {"retrieval": True, "judge": True}, "open() must run on the backend loop"
+
+    status, state = _request(port, "GET", "/api/state")
+    assert status == 200 and json.loads(state)["top_k"] == 6
+
+    status, grid = _request(port, "POST", "/api/inspect", {"question_id": "42"})
+    assert status == 200 and "q42" in grid
+
+    status, error = _request(port, "POST", "/api/knobs", {"top_k": "abc"})
+    assert status == 400 and "must be an integer" in error, "an invalid knob must not answer 200"
+
+    status, error = _request(port, "POST", "/api/inspect", {"question_id": "999999"})
+    assert status == 400 and "not in split" in error
+
+    status, probed = _request(port, "POST", "/api/probe", {"text": "beta"})
+    assert status == 200 and "NOT a retrieval lever" in probed
+
+    status, error = _request(port, "GET", "/api/nonesuch")
+    assert status == 404
 
 
 
