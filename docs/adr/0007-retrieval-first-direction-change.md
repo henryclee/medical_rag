@@ -73,5 +73,8 @@ this project considers unsolved.
 `../../experiments/phase6/FINDINGS.md` (4/20 wording recall at k=5; the
 "cannot distinguish" admission); `../../experiments/retrieval_tuning/FINDINGS.md`
 (run `20260929T120215Z`: the grid, the `*_rerank` cap, the 18/20 fallback, the
-lexical degeneracy); `../../refactor_plan.md` §1-3 for the full argument with
-`path:line` citations.
+lexical degeneracy). §1-3 of the pre-R1 working document argued all of this with
+`path:line` citations; it is no longer in the tree, so read it with
+`git show 8654e08:refactor_plan.md` -- and note that its citations name files R1
+moved or deleted, which is why the argument was lifted into this ADR rather than
+left behind a link.

@@ -67,4 +67,5 @@ survives, that is the evidence that re-chunking deserves its cache bill.
 `src/medical_rag/data/chunking.py` (the vendored MedRAG section splitter -- no
 token window anywhere); `../../experiments/retrieval_tuning/FINDINGS.md` (the
 lexical degeneracy that R4 attacks, measured on this frozen chunking);
-`../../refactor_plan.md` §9.2 (deleting the two dead keys rather than wiring them).
+`../../PLAN.md`'s R1 audit trail (the call to delete the two dead keys rather than
+wire them; argued in §9.2 of `git show 8654e08:refactor_plan.md`).

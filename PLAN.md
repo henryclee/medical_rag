@@ -14,8 +14,10 @@ calls**. The LLM is a remote OpenAI-compatible endpoint on `:8080`; nothing here
 runs a model locally, and the judge is the only model the mainline pays. Contracts
 live in [`interfaces.md`](./interfaces.md).
 
-**Why this is the project now.** Three facts, each measured rather than argued
-(full version with `path:line` citations in [`refactor_plan.md`](./refactor_plan.md) §1-3):
+**Why this is the project now.** Three facts, each measured rather than argued. The
+argument in full is [ADR-0007](./docs/adr/0007-retrieval-first-direction-change.md);
+the working document that produced it, with `path:line` citations against the pre-R1
+tree, is `git show 8654e08:refactor_plan.md`:
 
 - **The old study would have measured the wrong thing.** Phase 6 found the gold
   option's *wording* reaching the excerpts for only 4/20 questions at k=5, so
@@ -111,9 +113,17 @@ chunks as controls*, reported per class rather than as one agreement percentage;
 silent-drop audit proving `judgments == candidates` per batch at full prose length;
 one rubric variant stored under its own sha to measure verdict stability; a test that
 gold answer text cannot reach the prompt. Then grow the pinned sample 20 → ~100 by
-containment and pay the judge calls once, resumable and circuit-breaker guarded.
+containment and pay the judge calls once, resumable and circuit-breaker guarded. The
+known-bad controls are already named, so the hand-check starts from a list rather than
+a hunch: `article-128082_187` (rank-1 for 6 of the 20), `article-17453_34`,
+`article-40888_0`, `article-128082_185`
+([`TUNING.md`](./experiments/retrieval_tuning/TUNING.md)).
 *Deliverable:* `experiments/retrieval/R2/FINDINGS.md` + the tracked oracle snapshot.
-**This phase spends real endpoint time — needs a go-ahead.**
+**This phase spends real endpoint time — needs a go-ahead.** Price it from a measured
+number: the 20-question grid paid ~820 graded chunks in ~45-60 min sequential on the
+shared `:8080`, so ~80 unseen questions is hours of a resource everything else here
+also wants. `run_retrieval_grid.py --dry-run` prints the unseen-pair batch count
+before a call is made; quote that, not a guess.
 
 **R3 — Corpus ceiling.** `retrieval/ceiling.py` already exists and spends nothing:
 it pushes the gold option's own wording through a literal scan of all 380,454 chunk
@@ -233,8 +243,76 @@ question numbers in `interfaces.md` and the phase `FINDINGS.md` files still reso
 - `experiments/retrieval/R*/FINDINGS.md` — where R2-R6 land
   ([convention](./experiments/README.md)). Raw run dirs stay gitignored under
   `outputs/exploration/`.
-- [`refactor_plan.md`](./refactor_plan.md) — the R1 refactor's own plan, kept as the
-  audit trail for what moved and what was deleted.
+
+## R1 audit trail
+
+R1 moved code and deleted scaffolding; it changed no measurement. That claim is what
+the re-render gate above is for, and this section is the half an ADR cannot carry:
+the old module names still appear inside the frozen `FINDINGS.md` tables and in the
+alias map at the top of `tests/test_retrieval_tuning.py`, so the map has to stay
+readable by someone who never saw the old tree. The pre-R1 state is recoverable —
+`git show 8654e08:refactor_plan.md` is the working document this section replaced,
+and its `path:line` citations were taken against `00cd725`, so they point at files
+that no longer exist. Read them as history, not as navigation.
+
+**Moved** — from `experiments/retrieval_tuning/` into the package, CLIs into
+`scripts/`. Each had no counterpart in `src/`, so every row is a move, not a merge:
+
+| Was | Now | Why it moved |
+| --- | --- | --- |
+| `judge_harness.py` | `eval/harness.py`, + `scripts/run_retrieval_grid.py` | the measurement is the product, not scaffolding around one |
+| `judge_prompt.py` | `eval/rubric.py` | wording moved verbatim, so all 926 cached verdicts survived the rename |
+| `judge_cache.py` | `eval/judge.py` | the oracle, per ADR-0008 |
+| `metrics.py` | `eval/metrics.py` | one `recall@k`, so a browser cell and the table cannot disagree |
+| `chunk_store.py` | `eval/store.py` | the sidecar that lets a run be read without the 467 MB pickle |
+| `strategies.py` | `retrieval/strategy.py` | also became `build_retriever()` and `resolve_index_dir()` — the two that `raw_rag.py` used to reach through a `sys.path` insert |
+| `bm25_index.py` | `retrieval/lexical.py` | retrieval was dense-only before it existed |
+| `hybrid.py` | `retrieval/fusion.py` | RRF is pure, and grid and config need the same one |
+| `ceiling.py` | `retrieval/ceiling.py` | adopted `text.chunk_match_rank` rather than a second normalization of "same text" |
+| `render.py` (~1,200 lines, moved as a unit; not rewritten) | `eval/report.py`, `eval/inspector.py`, `eval/lab.py` | tables split out; the HTML grid view stayed with the inspector. `eval/report.py` is unrelated to the deleted `analysis/report.py` stub |
+| `inspect_retrieval.py` | `eval/inspector.py`, + `scripts/inspect_retrieval.py` | logic importable and therefore testable; the CLI stays a wrapper |
+| `serve.py` | `eval/lab.py` | drives `Inspector`; only its imports changed |
+| `reformulate.py` | `eval/rewrite.py` | the code moved; the *lever* stayed in the backlog |
+| `scripts/exploration/_common.py` | `eval/runlog.py`, **not** shimmed | five modules imported it across that boundary and it had no home; a re-export shim would only preserve the fiction that `scripts/` owns code `src/` imports |
+
+**Deleted**, per ADR-0007 — cut with the study rather than left compiling behind a
+"deferred" note:
+
+- The seven docstring-only stubs and their now-empty subpackages:
+  `modules/{reformulator,verifier}.py`, `experiment/{conditions,runner,metrics}.py`,
+  `analysis/{failure_taxonomy,report}.py`. No code and not even a
+  `NotImplementedError`, so nothing that could run was lost.
+- `scripts/run_pilot.py`, `scripts/run_experiment.py`.
+- `tests/test_reformulator.py`, `tests/test_verifier.py` — five lines each, zero test
+  functions. They collected and passed, which is worse than being absent.
+- `config/conditions.yaml`, the `verifier`/`reformulator` blocks, their three config
+  models and their cross-field validator, and `load_config()`'s requirement that the
+  file exist. The trap worth remembering: nothing read those blocks but their own
+  validator, yet they were *required* fields — so deleting the YAML without the model
+  change broke every caller at once, including both tuning CLIs.
+- `retrieval.chunk_size` / `chunk_overlap` — deleted, not wired up (ADR-0009).
+- `prompt.md`, whose only instruction was to stop touching code. `.gitignore` still
+  excludes that name, so a new one is invisible to `git status`; the exclusion is
+  deliberate, not an oversight.
+
+**Kept, and labelled frozen rather than mainline**, so nobody re-derives them:
+`raw_rag.py`, `closed_book.py`, `probe_models.py`, `audit_run.py`, and the
+answer/verification prompt builders with `parse_answer`; `model_a`/`model_b` in
+`config/models.yaml`, which the frozen Phase 5-6 scripts still read while the
+mainline reads only `judge_model`; `data/chunking.py` with no callers.
+
+**Judgement calls made without asking** — each still veto-able, and each a one-edit
+revert:
+
+1. Delete, don't comment out. A stub directory is how a plan pretends it has an
+   implementation, and this repo already published a table computed by a lever that
+   never ran (the `__reform` column, 18/20 fallbacks).
+2. The two dead chunk keys were deleted rather than wired into `build_index.py`.
+   StatPearls is cut by article section, never by a 512-token window, so making them
+   live would trade one lie for a louder one.
+3. `data/chunking.py` survives with no callers, as the backlog lever's home.
+4. `tests/test_exploration_common.py` kept its name while its subject became
+   `eval/runlog`. Renaming it would have buried the diff that actually matters.
 
 ## Related docs
 

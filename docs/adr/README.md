@@ -16,8 +16,9 @@ edit, test, or command; the debates that produced those constraints live here.
 | [0008](./0008-judge-cache-as-ground-truth.md) | The judge verdict cache is the measurement oracle | `TUNING.md`'s judge-reliability question | Accepted; R2 must validate it |
 | [0009](./0009-corpus-and-chunking-frozen.md) | Corpus + chunking frozen; dead chunk keys deleted | implicit constraint | Accepted, with expiry |
 
-0007-0009 came from the direction change described in
-[`../../refactor_plan.md`](../../refactor_plan.md); 0002 and 0006 were edited in
+0007-0009 came from the direction change now recorded in
+[`../../PLAN.md`](../../PLAN.md) and its R1 audit trail (the working document that
+argued for it is `git show 8654e08:refactor_plan.md`); 0002 and 0006 were edited in
 their `Status:` sections only, since rewriting a superseded argument would destroy
 the thing an ADR exists to preserve.
 

@@ -130,6 +130,5 @@ measurement. [experiments/retrieval_tuning/TUNING.md](./experiments/retrieval_tu
 -- the method. [experiments/README.md](./experiments/README.md) -- what is tracked
 as evidence and why. [interfaces.md](./interfaces.md) -- contracts.
 [file_layout.md](./file_layout.md) -- the tree.
-[refactor_plan.md](./refactor_plan.md) -- why the tree looks like this now.
 [docs/adr/](./docs/adr/README.md) -- decisions argued out once so they stop being
 re-litigated.

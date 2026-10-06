@@ -22,10 +22,11 @@ plausible result computed from the wrong input -- rather than arithmetic:
   so `aggregate_views` counts questions rather than clicks, and answers a bad knob
   with a 400 rather than a 200 holding a traceback (`serve`, `render`)
 
-The modules under test moved into the package (R1 of `refactor_plan.md`); these
-long-standing test files keep their original short names for them through the
-aliases below, because the assertions are about behaviour and renaming 1300 lines
-of references would only bury the diff. The mapping, if you are chasing a name:
+The modules under test moved into the package in R1 -- `PLAN.md`'s audit trail has
+the full old-name map; these long-standing test files keep their original short
+names for them through the aliases below, because the assertions are about
+behaviour and renaming 1300 lines of references would only bury the diff. The
+mapping, if you are chasing a name:
 
     strategies    -> medical_rag.retrieval.strategy
     render        -> medical_rag.eval.report

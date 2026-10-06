@@ -19,8 +19,7 @@ requirements.lock.txt          Full `pip freeze` snapshot of the environment.
 .gitignore                     Excludes .venv/, data/, outputs/, caches, .env -- and `prompt.md`, which is worth knowing about: a root file by that name is invisible to `git status`, so deleting one looks like a no-op. Deliberately NOT excluded: experiments/, because exploratory evidence has to be versioned to be reviewable.
 .env / .env.example            `.env` is gitignored and holds the endpoint keys; `.env.example` is tracked and lists the variable names with no secrets. `load_config()` merges `.env` into `os.environ` (an exported value wins; an empty `KEY=` stays empty), so `source` is only needed for raw `curl` checks.
 README.md                      What the repo does now, and the one command that scores a retrieval hypothesis.
-PLAN.md                        The operating plan: R1-R6, the constraints that each cost a bad measurement, the backlog.
-refactor_plan.md               R1's own record -- what moved, what was deleted, and the judgement calls made without asking. Read it before asking "why is this here?".
+PLAN.md                        The operating plan: R1-R6, the constraints that each cost a bad measurement, the backlog, and the R1 audit trail -- what moved, what was deleted, and the judgement calls made without asking. Read that trail before asking "why is this here?".
 interfaces.md                  Public contracts: signatures, invariants, stability.
 environment.md                 Runtimes, versions, setup. Its endpoint section is stale (two `mlx_lm.server` instances on :8081/:8082); `config/models.yaml`'s header is authoritative -- one oMLX on :8080.
 
@@ -90,6 +89,10 @@ outputs/probes/                Gitignored. probe_models.py rows + chains.
 ```
 
 ## What moved in R1, and why it was not left where it was
+
+The name-by-name map and the deletion list are `PLAN.md`'s
+**R1 audit trail**; this section is only the reasoning, because "why is this here?"
+is a different question from "where did it go?".
 
 `scripts/exploration/_common.py` is gone, not shimmed. It was the shared spine of
 every measurement script and it lived behind a `sys.path.insert`, with
