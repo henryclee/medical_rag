@@ -1,18 +1,20 @@
-"""Shared sample pinning and artifact writing for the exploratory phases.
+"""Shared sample pinning, row schema and artifact writing for measurement runs.
 
-Not a module of the package: `scripts/` is not importable, and this is
-exploration plumbing that the study's public surface must not depend on. It is
-imported by the sibling scripts in this directory (Python puts this directory
-on `sys.path` when one of them is run), and it is promoted into
-`experiment/runner.py` at Phase 9 if it earns it, so the study does not end up
-with two logging systems.
+This was `scripts/exploration/_common.py`, kept out of the package on the
+reasoning that exploration plumbing must not become public surface. That
+reasoning expired when retrieval became the mainline: the judge harness, the
+inspector and the frozen Phase 5/6 answer scripts all import from here, so the
+"plumbing" had three dependents and no home, held together by `sys.path.insert`
+calls in two of them. Its importers -- `closed_book.py`, `raw_rag.py` and the
+tests -- now import it from here. There is no re-export shim at the old path: a
+shim would only keep the pretence that `scripts/` owns this code.
 
 PLAN.md's exploratory-artifact convention is the reason this file exists. An
 exploratory phase is not finished when its check passes; it is finished when its
-evidence is reviewable months later, at the Phase 10 freeze, by someone asking
-"why did `model_b` get this one wrong?" with a `models.yaml` that has already
-been edited since. Three things follow, and they live here rather than in each
-script so that Phase 6 cannot drift from Phase 5:
+evidence is reviewable months later by someone asking "why did this question
+retrieve nothing useful?" with a `models.yaml` and a `default.yaml` that have
+already been edited since. Three things follow, and they live here rather than in
+each script so that one phase cannot drift from the last:
 
 1. **A pinned sample.** `select_sample()` ranks by a hash of
    `(sample_seed, question_id)` instead of `random.Random(seed).sample()`, which
@@ -25,11 +27,11 @@ script so that Phase 6 cannot drift from Phase 5:
    flushed the moment they are written, so a run interrupted 25 minutes in keeps
    its evidence instead of losing it, and `completed_keys()` makes `--resume`
    mean "do not re-fire those requests".
-3. **Self-describing rows.** Each row keeps `QuestionResult`'s field names (see
-   `interfaces.md`) so Phase 12's `classify_failure()` can read exploratory data
-   without a translation layer, and snapshots the `params` active for it, so the
-   log stays honest after `conditions.yaml`/`models.yaml` move on (open
-   question 9).
+3. **Self-describing rows.** Each row keeps the field names it was born with (see
+   `interfaces.md`), so artifacts written by an earlier phase stay readable
+   without a translation layer, and snapshots the `params` active for it --
+   because `default.yaml` and `models.yaml` will both have moved on by the time
+   anyone asks what produced a given row.
 
 Every row also carries `split`, because `MedQAQuestion.id` is the positional
 index *within* a split -- dev-split question `"7"` and test-split question `"7"`
@@ -746,42 +748,6 @@ def parse_notes(notes: Sequence[str]) -> dict[str, str]:
             raise SystemExit(f"--note expects KEY=VALUE, got {note!r}")
         parsed[key.strip()] = value.strip()
     return parsed
-
-
-# Typographic characters a StatPearls excerpt and a MedQA option can disagree on
-# for reasons that mean nothing. Dropped rather than folded, so the helper below
-# stays a substring test and does not grow into a parser.
-_STRIP_CHARS = dict.fromkeys(map(ord, "\u2018\u2019\u201c\u201d\u2013\u2014\u2212'\""), None)
-
-
-def _normalize(text: str) -> str:
-    """Casefold, drop quotes/dashes, collapse whitespace -- for containment tests."""
-    return " ".join(text.translate(_STRIP_CHARS).casefold().split())
-
-
-def chunk_match_rank(needle: str, chunks: Sequence[Any]) -> int | None:
-    """1-based prompt index of the first chunk containing `needle`, else None.
-
-    The cheapest available answer to "did the context we handed the model
-    actually contain the thing it needed?", which is where every RAG failure
-    classification eventually reduces. It is a string test, so read it with both
-    of its errors in mind: it *under*-counts (an excerpt explaining
-    "noncaseating granulomas" without the gold phrase "sarcoidosis" reads as
-    absent, though it is the useful excerpt) and it *over*-counts (an excerpt
-    that names the gold option in order to rule it out reads as present).
-    Under-counting is the commoner error at this corpus size, so treat a low hit
-    rate as evidence about the metric before evidence about the retriever, and
-    never call this accuracy.
-
-    Accepts anything with a `.content` (a `RetrievedChunk` or a stand-in).
-    """
-    probe = _normalize(needle)
-    if not probe:
-        return None
-    for index, chunk in enumerate(chunks, start=1):
-        if probe in _normalize(chunk.content):
-            return index
-    return None
 
 
 def missing_chunk_evidence(prompt: str, chunks: Sequence[Any]) -> list[str]:

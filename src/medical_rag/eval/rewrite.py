@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import json
 import re
-import sys
 from pathlib import Path
 
 import openai
@@ -39,12 +38,6 @@ from pydantic import BaseModel, Field, ValidationError
 from medical_rag.data.load_medqa import MedQAQuestion
 from medical_rag.generation.llm import LLMClient, LLMError
 from medical_rag.generation.prompt import build_reformulation_prompt
-
-_HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
-
-DEFAULT_PROMPT_PATH = _HERE / "reform_prompt.txt"
 
 REFORMULATION_SYSTEM_PROMPT: str = (
     "You rewrite medical exam questions into retrieval queries for a clinical "
@@ -127,8 +120,8 @@ def _is_transport(exc: BaseException) -> bool:
 def load_template(path: str | Path | None = None) -> str | None:
     """Read a local prompt override, or None to use production's builder.
 
-    `DEFAULT_PROMPT_PATH` is *not* loaded implicitly -- an experiment should not
-    start diverging from production because someone left a file behind. Passing
+    No file is ever loaded implicitly -- an experiment should not start
+    diverging from production because someone left a file behind. Passing
     `--reform-prompt` is the opt-in, and the file it names is what `context.md`
     then points at.
     """

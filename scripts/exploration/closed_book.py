@@ -61,7 +61,7 @@ from medical_rag.data.load_medqa import MedQAQuestion, load_medqa
 from medical_rag.generation.llm import LLMClient, LLMError
 from medical_rag.generation.prompt import build_answer_prompt
 
-from _common import (
+from medical_rag.eval.runlog import (
     DEFAULT_SAMPLE_SEED,
     EndpointCircuitBreaker,
     RunWriter,

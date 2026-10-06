@@ -5,11 +5,14 @@ knobs lived in a terminal loop that prints 110-character chunk bodies
 (`render.render_terminal` says so itself: "the HTML is where you read prose"), and
 the prose lived in a static `report.html` you switched to a browser to read and
 had to reload by hand. Every iteration was *type in terminal → squint → switch
-tabs → reload*, and outside the REPL it was *re-run the script*, which pays ~40 s
-of embedder + cross-encoder + 467 MB BM25 pickle to exercise one grid -- ~12 s
-measured on this machine for the five `__orig` cells at k=20 (two embedding passes,
-two exact searches over 380k rows, two BM25 scans, two rerank passes), so the load
-is the same order as the work and gets paid every time.
+tabs → reload*, and outside the REPL it was *re-run the script* -- which pays
+~4 s of loads (dataset 0.9 s, embedder + cross-encoder 1.3 s, the 445 MB BM25
+pickle 1.7 s, warm page cache) before it reaches the thing being tested: one
+five-cell `__orig` grid at k=20 is ~10-12 s (two embedding passes, two exact
+searches over 380k rows, two BM25 scans, two rerank passes; median 10.6 s,
+5.5-19.7 s over n=9, measured 2026-10-05 on MPS). The load is smaller than the
+work, but it is the part that is pure repetition, and a script pays it once per
+guess.
 
 This keeps that loaded state and puts a form in front of it. `Inspector` is
 untouched: it is constructed and `open()`ed exactly as `--repl` would, and every
@@ -42,7 +45,6 @@ from __future__ import annotations
 import asyncio
 import html
 import json
-import sys
 import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -55,13 +57,8 @@ from loguru import logger
 from medical_rag.data.load_medqa import MedQAQuestion
 from medical_rag.retrieval.retriever import RetrievedChunk
 
-_HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
-
-from ceiling import CeilingResult, probe  # noqa: E402
-from judge_cache import ensure_verdicts  # noqa: E402
-from render import (  # noqa: E402
+from medical_rag.eval.judge import ensure_verdicts
+from medical_rag.eval.report import (
     QuestionView,
     build_cells,
     render_ceiling,
@@ -69,6 +66,7 @@ from render import (  # noqa: E402
     render_main,
     render_toolbar,
 )
+from medical_rag.retrieval.ceiling import CeilingResult, probe
 
 # A handler that waits forever is worse than one that times out: the page would
 # show a spinner over a stale grid, which is the "looks current, isn't" failure
@@ -344,7 +342,7 @@ class Backend:
             return render_ceiling(result)
 
     async def chunk_route(self, chunk_id: str) -> str:
-        from chunk_store import resolve_chunks
+        from medical_rag.eval.store import resolve_chunks
 
         if self.insp.table is None:
             raise HttpError(409, "no index handle in this session")
@@ -523,7 +521,7 @@ class Backend:
         return applied
 
     def _write_report(self) -> list[Path]:
-        from inspect_retrieval import write_artifacts
+        from medical_rag.eval.inspector import write_artifacts
 
         meta = self.insp.meta({"served": "yes -- the header's knobs are the ones that produced this"})
         written = list(write_artifacts(self.insp.out_dir, self.insp.views, meta).values())

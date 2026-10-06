@@ -1,19 +1,21 @@
-# Retrieval tuning
+# Retrieval tuning — the harness's method doc
 
-Side track, not a numbered phase (see `PLAN.md` "Next actions"). Phase 6 came
-back underwhelming, and its own FINDINGS diagnosed why the result is hard to
-trust: at `top_k=5`, the gold answer's *exact wording* showed up in the
-retrieved excerpts for only 4/20 questions (8/40 rows). Three-quarters of
-Phase 6's rows can't distinguish "the model ignored good context" from "the
-context never had the answer." Before sinking more phases into prompts and
-downstream modules, validate the retrieval step itself: build a harness that
-uses a judge model to grade whether retrieved chunks are actually useful for
-answering the question, then use that signal to compare retrieval levers.
+This directory started as a side track and became the project (ADR-0007): the
+harness it built is now `src/medical_rag/eval/`, the plan it fed is the R-track in
+[`../../PLAN.md`](../../PLAN.md), and what is left here is prose — this file and
+[`FINDINGS.md`](./FINDINGS.md), which is frozen evidence and is not rewritten.
+
+Why it exists at all: Phase 6 came back underwhelming, and its own FINDINGS
+diagnosed why the result is hard to trust — at `top_k=5`, the gold answer's *exact
+wording* showed up in the retrieved excerpts for only 4/20 questions (8/40 rows).
+Three-quarters of Phase 6's rows can't distinguish "the model ignored good context"
+from "the context never had the answer." So validate the retrieval step itself
+first, with a judge model grading whether retrieved chunks are actually useful for
+answering the question, and use that signal to compare levers.
 
 Runs against Phase 5's pinned 20-question sample:
 `1312 2391 3998 4002 5209 5949 6205 6264 6727 6753 6771 7159 7502 7553 8966
-9293 9473 9572 9597 10064` (via `select_by_ids` in
-`scripts/exploration/_common.py`).
+9293 9473 9572 9597 10064` (via `select_by_ids` in `medical_rag.eval.runlog`).
 
 ## Judge design
 
@@ -40,11 +42,14 @@ the gold letter is in a chunk's `supports_options` — the judge is never told
 which option is correct, so the label is reusable across metrics and can't
 be gamed by an answer leaking into the grading prompt.
 
-Prompt and schema live in the harness script, not in
-`src/medical_rag/generation/prompt.py` — this is exploratory grading of
-retrieval candidates, not the production verification prompt (Phase 8's
-`Verifier`), and it should not shape the frozen interfaces until a lever
-proves itself.
+The rubric and schema live in `src/medical_rag/eval/rubric.py` — one home, not one
+per caller. They began inside the harness and `inspect_retrieval.py` grew a second
+copy, which is exactly how a cached verdict and the sha stamped beside it come to
+describe different wording. The harness now imports the rubric, stamps its sha, and
+words no prompt of its own. It stays separate from `generation/prompt.py` because
+grading *retrieval candidates* blind to the gold letter is a different contract from
+the frozen answer/verification prompts — and R2's rubric-variant experiment needs to
+hold two versions of this wording side by side without touching generation.
 
 ## Harness architecture — judge each chunk once, reuse everywhere
 
@@ -57,7 +62,7 @@ For each of the 20 questions:
    `outputs/exploration/retrieval_tuning/judge_cache/judged_chunks.jsonl`,
    keyed by `(question_id, chunk_id, judge_prompt_sha)`. The sha is part of
    the key on purpose: a verdict is a fact about a chunk *under one rubric*,
-   so editing `judge_prompt.py` invalidates every cached verdict instead of
+   so editing `eval/rubric.py` invalidates every cached verdict instead of
    silently mixing two generations of grading into one table.
 
 Every lever's metrics are then computed by looking up cached verdicts —
@@ -91,35 +96,46 @@ All against the same 20 questions and the same judge cache:
 5. **Reformulation-as-retrieval** — rewrite the query with the already
    implemented `build_reformulation_prompt()`
    (`src/medical_rag/generation/prompt.py`) via
-   `LLMClient(config.models["model_a"])`, then `Retriever.retrieve()` with
-   the rewritten query. Compares recall against the original-query dense
-   run and reuses existing production code — this answers PLAN.md's open
-   question 15 before Phase 7 builds the full `Reformulator` module.
+   `LLMClient(config.models["model_a"])`, then retrieve on the rewritten
+   query (`eval/rewrite.py`). It is the only lever here that spends
+   completions, and its one honest result so far is +0/+0/+5pp with the
+   rewrite falling back on 18/20 questions — so it sits in `PLAN.md`'s
+   backlog rather than in a phase, and no `__reform` column in the first grid
+   is evidence about it either way.
 
-## New BM25 index
+## The BM25 index
 
-No lexical index exists in the repo yet. Added self-contained under this
-directory — not `src/medical_rag/retrieval/` — since it's unproven; it only
-gets promoted into production code if a lever built on it wins at this
-tuning stage.
+There was no lexical index when this was written; there is now, and it was
+promoted into the package in R1 rather than staying here — the first grid made it
+load-bearing, and the lexical leg's 0/0/10 made it the thing R4 has to fix. Two
+facts about the artifact worth knowing before touching it:
 
-- `bm25_index.py` — pulls `(chunk_id, title, content)` for all 380,454 rows
+- It is a 445 MB pickle of tokenized corpus, so it outlives the code that wrote it.
+  Pickles embed a class's module path, which means the on-disk index still names
+  `bm25_index.BM25Index`, the pre-move module; `lexical.py` resolves that legacy
+  path and logs a warning instead of demanding a rebuild. R4 rebuilds anyway (it
+  changes the tokenizer), which retires the shim.
+- The pickle carries no corpus or tokenizer version. That is a real gap, not
+  cosmetic: nothing on disk says which tokenizer produced it. R4 writes it.
+
+- `retrieval/lexical.py` — pulls `(chunk_id, title, content)` for all 380,454 rows
   from the existing LanceDB table (`load_index()` + `.to_pandas()`),
   tokenizes with a simple lowercase regex splitter, builds
   `rank_bm25.BM25Okapi`, and pickles the chunk_id list + BM25 object to
   `data/index/statpearls_bm25.pkl` (gitignored, regenerable — same
   convention as the vector index). One-time build, cached; rebuilds only on
   an explicit `--rebuild-bm25` flag.
-- `hybrid.py` — the RRF fusion function over two ranked chunk_id lists.
+- `retrieval/fusion.py` — the RRF fusion function over two ranked chunk lists.
 - New dependency: `rank_bm25` (pure Python), exact-pinned in
   `pyproject.toml` like the project's other dependencies.
 
 ## Harness script
 
-`judge_harness.py`, following `scripts/exploration/`'s established CLI
-conventions (`--dry-run`, `--resume`, `--note KEY=VALUE`), reusing
-`RunWriter`, `error_row`/`result_row`, and `EndpointCircuitBreaker` from
-`scripts/exploration/_common.py` for the judge calls.
+`src/medical_rag/eval/harness.py`, run as `scripts/run_retrieval_grid.py` (the
+script is a thin wrapper — the package module has the same CLI). It keeps
+`scripts/exploration/`'s conventions (`--dry-run`, `--resume`, `--note KEY=VALUE`)
+and reuses `RunWriter`, `error_row`/`result_row` and `EndpointCircuitBreaker` from
+`eval/runlog.py` for the judge calls.
 
 Outputs:
 
@@ -128,27 +144,28 @@ Outputs:
   lists, the judge's verdicts for their union, the reformulation record
   including its `raw_response` and any parse error, `new_judgments`,
   queries, provenance), `chunks.jsonl` (the chunk text those ids point at —
-  see `chunk_store.py`, which is what lets a run be re-read without the
+  see `eval/store.py`, which is what lets a run be re-read without the
   380k-row index), and `context.md`. It also creates `chains/`, and leaves it
   empty: this harness never calls `RunWriter.write_chain`, because the exchange
   worth keeping is already on the row (`reformulation.raw_response`, the parse
   error) or in the shared judge cache (verdict + reason). Both run dirs on disk
   confirm it — `chains/` with zero files. Do not cite `chains/` as evidence for
   a retrieval-tuning run; cite the row. Per-question markdown dumps are
-  `inspect_retrieval.py`'s job, not the harness's — the row already carries the
+  `scripts/inspect_retrieval.py`'s job, not the harness's — the row already carries the
   question, options, and every query variant used.
 - `outputs/exploration/retrieval_tuning/judge_cache/judged_chunks.jsonl`
-  (gitignored, append-only, shared across runs; `judge_cache.py --stats`
-  prints how much of it is still usable under the current rubric).
+  (gitignored, append-only, shared across runs; `.venv/bin/python -m
+  medical_rag.eval.judge --stats` prints how much of it is still usable under the
+  current rubric, and how much a rubric edit would invalidate).
 - `experiments/retrieval_tuning/FINDINGS.md` (tracked, written by the
   harness run — not by hand, and re-writable from stored rows with
   `--rerender <run>`, which is free): the recall@k / relevant_fraction@k
   table per grid cell, the per-strategy Δ table, the reformulation
   integrity block, a few concrete chunk-judgment examples (a `relevant` and
   an `irrelevant` verdict each, to sanity-check the judge's calibration),
-  and the resulting recommendation for what the Phase 6 rerun should use.
+  and the recommendation the run produced.
 
-## Reading a run back (`inspect_retrieval.py`)
+## Reading a run back (`scripts/inspect_retrieval.py`)
 
 A number in `FINDINGS.md` is not inspectable evidence unless the chunks
 behind it are. This script renders, per question, a 10-cell grid —
@@ -180,27 +197,30 @@ The reading surface and the interactive surface were in different windows: the
 knobs lived in a terminal REPL that truncates chunk bodies to 110 characters (its
 own renderer says "the HTML is where you read prose"), and the prose lived in a
 `report.html` you reloaded by hand. Outside the REPL, every guess re-ran the script
-and re-paid ~40 s of embedder + cross-encoder + the 467 MB BM25 pickle to exercise
-one grid. Measured here (MPS, k=20, the five `__orig` cells): **~12 s per grid**,
-so the load is the same order as the work — and `--serve` pays it once per session
-instead of once per guess. Note that `inspect_retrieval.py`'s `Inspector` docstring
-still claims "~2 s", which is roughly what a `--query` override on a warm process
-costs before the rerank passes, not what a full grid costs.
+and re-paid its startup before testing anything. Measured 2026-10-05 (MPS, warm
+page cache): the loads are **~4 s** — dataset 0.9 s, index + embedder +
+cross-encoder 1.3 s, the 445 MB BM25 pickle 1.7 s — and one five-cell `__orig` grid
+at k=20 is **~10-12 s** (median 10.6 s, 5.5-19.7 s over n=9). So the load is the
+smaller half, and it is the half that is pure repetition: `--serve` pays it once per
+session instead of once per guess. (Two earlier claims here — "~40 s load", and the
+`Inspector` docstring's "~2 s grid" — had the ratio inverted; the docstring now
+carries the measured split, and a cold page cache is the only thing that makes the
+pickle look expensive.)
 
 `--serve` keeps that loaded state behind a localhost form:
 
 ```bash
 # the full interactive grid (loads models + BM25, no endpoint until you click Judge)
-.venv/bin/python experiments/retrieval_tuning/inspect_retrieval.py --serve
+.venv/bin/python scripts/inspect_retrieval.py --serve
 
 # browse an already-judged run's verdicts with nothing loaded at all
-.venv/bin/python experiments/retrieval_tuning/inspect_retrieval.py --serve --no-retrieve \
+.venv/bin/python scripts/inspect_retrieval.py --serve --no-retrieve \
     --from-run outputs/exploration/retrieval_tuning/grid_smoke_check
 
-.venv/bin/python experiments/retrieval_tuning/inspect_retrieval.py --serve --dry-run  # route table
+.venv/bin/python scripts/inspect_retrieval.py --serve --dry-run  # route table
 ```
 
-`serve.py` builds no second renderer: the page body is `render.render_main`, the
+`eval/lab.py` builds no second renderer: the page body is `report.render_main`, the
 same function the static `report.html` is built from, and every route calls
 `aretrieve_grid` / `ensure_verdicts` / `build_cells`. `--serve --dry-run` prints the
 route table; `--port 0` binds a free port so two hypotheses can be compared in two
@@ -242,9 +262,9 @@ ranked it #60"** from **"StatPearls never contained it."** `dense__orig` sits at
 states and `FINDINGS.md` is silent on which -- and only the first is winnable by
 reformulation, k, or a reranker.
 
-It runs the gold option's own wording two ways (`ceiling.py`), spending no
+It runs the gold option's own wording two ways (`retrieval/ceiling.py`), spending no
 completions: a literal scan over all 380,454 chunk bodies already in memory in the
-BM25 pickle, and `strategies.retrieve_base()` with that wording as the query. If a
+BM25 pickle, and `retrieval.strategy.retrieve_base()` with that wording as the query. If a
 query that *contains* the answer cannot surface a chunk that *contains* it, the
 bottleneck is the index.
 
@@ -255,7 +275,7 @@ This directory has already published a wrong number off an unlabelled column
 (`reform_dense`, +5pp recall@20 from a rewrite that fell back on 18/20 questions).
 
 And the bound is one-directional: **0 matches means "not stated in these words,"
-not "not in StatPearls."** Phase 8 found 32/40 rows chose wording appearing nowhere
+not "not in StatPearls."** Phase 6 found 32/40 rows chose wording appearing nowhere
 in their excerpts -- these models answer from understanding, so a paraphrased answer
 can be fully supported by chunks a literal scan cannot see. Treat a miss as a hint
 about wording, never as evidence of absence.
@@ -289,9 +309,11 @@ writeup chunks win nearly every query. Hypothesis, untested: the BM25 corpus
 is everything in the index including narrative case reports, and with
 `b=0.75` length normalization over a mean-chunk-length baseline, a long chunk
 that repeats general clinical vocabulary outranks a short precise one on any
-vignette. `inspect_retrieval.py --sample 3` shows this in ten seconds; fixing
-it means either a better tokenizer/field weighting or excluding narrative
-boilerplate from the lexical field, which is Phase 7's problem, not this one.
+vignette. `scripts/inspect_retrieval.py --sample 3` shows this in a few grid
+passes; fixing it means a better tokenizer, field weighting, or excluding
+narrative boilerplate from the lexical field — which is **R4**, and R4's tracked
+metric is the count of distinct chunks filling the top-5 (59/100 here), because
+that number moves even when recall barely does.
 
 The degeneracy is reproducible, not a one-run artifact. On the 2026-09-29
 probe described below, whose first question is the same q1312, three of the
@@ -325,23 +347,25 @@ over the real one; the file was restored afterwards with
 `--rerender outputs/exploration/retrieval_tuning/20260929T120215Z`, and no
 probe should ever be the tracked findings.
 
-## Open questions this side-track should record, not silently resolve
+## What this directory left open, and where it lives now
 
-- Is `judge_model` (`Qwen3.8-Flash-Next`) actually more capable than
-  `model_a`/`model_b` for this grading task, or just differently sized?
-  Worth a quick spot-check against a handful of hand-labeled chunks before
-  trusting its verdicts at scale.
-- The BM25 tokenizer is a simple splitter, not a real search engine's
-  stemmed/stopword-aware tokenizer — good enough to compare against dense
-  retrieval directionally, not a production-grade lexical index.
-- All three models (`model_a`, `model_b`, `judge_model`) share one `:8080`
-  oMLX process — judge calls run sequentially with the same
-  `EndpointCircuitBreaker` discipline as Phase 6, not assumed free
-  concurrency.
+- **Is `judge_model` (`Qwen3.8-Flash-Next`) actually good at this grading task?**
+  Written here as "worth a quick spot-check before trusting its verdicts at
+  scale." That is no longer a suggestion: ADR-0008 made these verdicts the oracle,
+  so R2 validates the judge — stratified hand-check with the boilerplate chunks as
+  known-bad controls, a silent-drop audit on the batched calls, one rubric variant
+  under its own sha — *before* any R4/R5 number gets quoted. PLAN.md open
+  question 1.
+- **The BM25 tokenizer is a naive splitter** — no stemming, no stopword removal,
+  no field weighting. That stopped being a caveat and became R4's job.
+- **All three models share one `:8080` oMLX process.** Judge calls stay sequential
+  under the same `EndpointCircuitBreaker` discipline as Phase 6; concurrency is not
+  free and R2's cache build inherits that. Constraint, not open question.
 
-## After this
+## What comes next
 
-Rerun Phase 6 end-to-end against the tuned retriever (the original Phase 6
-run stays on disk as the dense-only baseline), then Phase 7 compares
-reformulation against that rerun, opening from this experiment's
-`FINDINGS.md` rather than a fresh recall recount.
+The Phase 6 rerun and Phase 7 this file used to point at are cut (ADR-0007). The
+order is now R2 → R3 → R4 → R5 → R6, in `PLAN.md`. This file stays the method doc
+for the harness those phases run; their numbers land in
+`experiments/retrieval/R*/FINDINGS.md`, and `FINDINGS.md` in this directory stays
+frozen — it is the evidence the direction change was made on.

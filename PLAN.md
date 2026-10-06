@@ -1,124 +1,244 @@
-# Medical RAG Experiment — Project Plan
+# Medical RAG — Retrieval Optimization Plan
 
-A reproducible pipeline for running retrieval-augmented generation experiments on medical board-exam questions (MedQA-USMLE): it measures how interventions — retrieval, reranking, query reformulation, answer verification — move accuracy, and whether that effect depends on which LLM is answering. The pipeline is the artifact; the current study is one instantiation of it, and which levers are active stays provisional until the design freeze. Generation is never local — every model sits behind an OpenAI-compatible endpoint and the pipeline only makes HTTP calls to it. Retrieval runs against StatPearls: 380,454 chunks (NCBI's live archive has grown since MedRAG's 301,202-snippet paper snapshot), embedded once with `BAAI/bge-small-en-v1.5` under BGE's asymmetric query/passage convention, stored in an exact-search LanceDB table, and reranked with `cross-encoder/ms-marco-MiniLM-L-6-v2` at 20 → 5. Exact search at this corpus size (and why no ANN index), the prompt template and `min_chunks` were measured rather than assumed; the contracts live in [`interfaces.md`](./interfaces.md).
+A reproducible retrieval-optimization study: MedQA-USMLE questions
+(`GBaker/MedQA-USMLE-4-options`, 1,273 test / `train` dev split) answered from
+StatPearls — 380,454 chunks from 9,652 articles, embedded once with
+`BAAI/bge-small-en-v1.5` under BGE's asymmetric query/passage convention, stored
+in an exact-search LanceDB table (no ANN at this size), reranked with
+`cross-encoder/ms-marco-MiniLM-L-6-v2`. Retrieval quality is measured **offline**:
+`judge_model` grades whether each retrieved chunk supports the gold option, blind
+to the letter, those verdicts are cached and versioned by rubric hash
+([ADR-0008](./docs/adr/0008-judge-cache-as-ground-truth.md)), and
+`scripts/eval_retrieval.py` scores a strategy against them with **zero endpoint
+calls**. The LLM is a remote OpenAI-compatible endpoint on `:8080`; nothing here
+runs a model locally, and the judge is the only model the mainline pays. Contracts
+live in [`interfaces.md`](./interfaces.md).
 
-**Where the project stands.** Phases 1–6 are complete: a pip-installable `src`-layout package (`medical_rag`) with a working config layer, both data loaders, a populated index on disk, a live-verified `LLMClient` with the three prompt builders, and a tested exploration harness. Both arms have been measured closed-book and end-to-end with raw RAG on the same pinned 20 questions. Everything from query reformulation and answer verification through the runner, statistics, and reporting is still a stub. End state: `python scripts/build_index.py` and `python scripts/run_experiment.py` reproduce the study from scratch, producing `outputs/runs/summary.csv|json`, figures under `outputs/figures/`, and a `RESULTS.md` reporting effect sizes and confidence intervals for the contrasts actually run.
+**Why this is the project now.** Three facts, each measured rather than argued
+(full version with `path:line` citations in [`refactor_plan.md`](./refactor_plan.md) §1-3):
 
-This file is the operating plan, not the debate record. Decisions argued out in earlier drafts live in [`docs/adr/`](./docs/adr/README.md) — see [Decision record](#decision-record); evidence lives in `experiments/phase*/FINDINGS.md`. The condition set, prompt wording, `min_chunks`, the reformulator's retry policy and the primary significance test remain **provisional until the Phase 10 design freeze**; Phases 7–9 exist to pressure-test them against the dev split.
+- **The old study would have measured the wrong thing.** Phase 6 found the gold
+  option's *wording* reaching the excerpts for only 4/20 questions at k=5, so
+  three quarters of its rows could not tell "the model ignored the context" from
+  "the context never had it" ([phase6 FINDINGS](./experiments/phase6/FINDINGS.md)).
+  Judged semantically instead, the shipped funnel's recall is 45%
+  ([retrieval_tuning FINDINGS](./experiments/retrieval_tuning/FINDINGS.md)).
+  A generator-side result on that context is a retrieval measurement wearing a
+  model label.
+- **The cheapest lever was the un-examined one.** `dense_rerank`'s 45/45/45 across
+  k=5/10/20 is not a plateau — the funnel hands the reranker 5 candidates and asks
+  for 5, so it *cannot* rise. And the lexical leg is not weak, it is degenerate: 59
+  distinct chunks fill 100 top-5 slots, one chunk is rank-1 for 6/20 questions.
+- **The asymmetry is cost.** A retrieval hypothesis now costs index work plus
+  arithmetic against cached verdicts; a generation hypothesis cost ~7 h of shared
+  endpoint time per condition per arm. Fixing the input got both cheaper and more
+  attributable. [ADR-0007](./docs/adr/0007-retrieval-first-direction-change.md)
+  records cutting Phases 7-13 rather than deferring them.
+
+**Where things stand.** Phases 1-6 are complete and frozen (their `FINDINGS.md`
+files are evidence and are not rewritten). The grid has been run once, on 20
+questions. **R1 is done**: the harness, metrics, judge cache, BM25, fusion and the
+ceiling probe are now package code (`src/medical_rag/eval/`,
+`src/medical_rag/retrieval/`), the deleted stubs are gone, and grid and shipped
+path call one `retrieve_base()`. The next phase is **R2**, which is the one that
+costs endpoint time — nothing downstream is believed until the oracle is validated.
 
 ## Constraints in force
 
-Each of these has already cost a bad measurement when ignored.
+Each of these has already cost a bad measurement, or will.
 
-- **Dev split only** in Phases 7–9; exploratory artifacts never land in `outputs/runs/`, and no n=20 phase is cited in `RESULTS.md`.
-- **Reuse Phase 5's pinned 20 questions** — `1312 2391 3998 4002 5209 5949 6205 6264 6727 6753 6771 7159 7502 7553 8966 9293 9473 9572 9597 10064`. Do not resample: the cross-arm invariants that make Phase 6's comparison meaningful (identical `retrieved_chunk_ids` per question, paired `base_answer`) are only checkable because the sample is identical.
-- **Both arms share one oMLX endpoint on `:8080`** ([ADR-0005](./docs/adr/0005-model-b-termination-endpoint-side.md)). Per-arm throughput is not free, so concurrency must be measured as a shared-endpoint sweep — `--concurrent-models` confounds it by interleaving the arms.
-- **Re-use every completion; never re-run to fix a number.** Recompute from artifacts and add a `FINDINGS.md` section saying so. "Resume and never re-run" is implemented: `completed_keys()` counts only cells that earned a completion — an `error_row()` means *attempted and failed*, never "done" (that trap cost Phase 5's first run 17 silent no-ops) — and `EndpointCircuitBreaker` (3 consecutive transport failures) abandons an arm instead of walking the rest of the sample on refusals.
-- **Both arms' sampling is configured outside git.** `~/.omlx/model_settings.json` supplies `model_b`'s `enable_thinking: true`, `thinking_budget_enabled: true`, `thinking_budget_tokens: 4096`, `top_k: 40` (which is what actually makes it terminate — [ADR-0005](./docs/adr/0005-model-b-termination-endpoint-side.md)) and `model_a`'s `top_k: 20`, `repetition_penalty: 1.05`, neither of which the client sends. If Phase 10 does not record those values, the frozen design is not reproducible.
-- **Keep every chain, not just the wrong ones** — failures-only retention hides the base rate.
-- **Every number quoted in a `FINDINGS.md` must be reproducible by `scripts/exploration/audit_run.py`.** It re-reads `results.jsonl`, re-derives per-arm accuracy with Wilson CIs, error/truncation/recovery counts, chain-length stats, option-letter distributions and cross-arm invariants, prints PASS/FAIL against the claims in that file, and exits nonzero on a mismatch — so "recomputed from artifacts" is machine-checked rather than asserted (Phase 6: 13 PASS, 0 FAIL). Its own first drafts caught two real bugs (comparing `base_answer` across arms; counting `both_wrong` as RAG loss), either of which would have published a wrong reconciliation.
+- **The harness only measures the union of strategies it ran.** A new lever's
+  chunks are unjudged until that lever is in the grid, and an unjudged slot scores
+  as *not supporting* — so a brand-new strategy's number is a floor. Add candidates
+  to the grid; do not "measure" a new lever against yesterday's cache.
+  `eval_retrieval.py` prints coverage next to recall and `--require-coverage` makes
+  the floor fail loudly.
+- **Never compare a `*_rerank` cell's recall@10/20 against an unreranked cell's.**
+  The funnel caps it at `top_k_rerank` (see the 45/45/45 above).
+- **Corpus and chunking are frozen for this track.** Verdicts are keyed
+  `(question_id, chunk_id, judge_prompt_sha)`; changing chunk geometry changes
+  every `chunk_id` and orphans the entire cache — a bill of roughly the whole R2
+  judge spend. [ADR-0009](./docs/adr/0009-corpus-and-chunking-frozen.md).
+- **Dev split only, and the pinned sample only grows by containment.** The 20
+  questions Phases 5-6 measured: `1312 2391 3998 4002 5209 5949 6205 6264 6727
+  6753 6771 7159 7502 7553 8966 9293 9473 9572 9597 10064`. R2's ~100 must
+  contain them as a strict subset and a preflight must assert it — do **not** just
+  draw `size=100, seed=1`, which will not.
+- **The oracle is tracked and versioned.** `judge_prompt_sha` stays part of the
+  cache key; R2 commits a verdict snapshot under `experiments/retrieval/evalset/`
+  because a measurement nobody can read is not evidence.
+- **Judge discipline is the old endpoint discipline.** `judge_model` shares `:8080`
+  with the frozen arms: keep `EndpointCircuitBreaker` and resume, never re-run a
+  batch to change a number (recompute from artifacts and say so), and record the
+  judge's server-side sampling the way `model_b`'s was recorded — under ADR-0008
+  those settings shape ground truth, not just a completion.
+- **No number is a result unless `scripts/eval_retrieval.py` re-derives it.** That
+  is `audit_run.py`'s successor role. `--rerender <run>` is the offline half of the
+  same rule: a refactor that changes a cell is a bug, and this catches it.
 
-## Exploratory-artifact convention
+## Current numbers to beat
 
-Every exploratory phase (5–9) produces three artifacts, all tracked except the raw directory:
+Run `20260929T120215Z`, n=20, semantic recall@5/10/20
+([source](./experiments/retrieval_tuning/FINDINGS.md)):
 
-1. **A re-runnable script** in `scripts/exploration/` — never a REPL session or a deleted throwaway. It pins its sample (`--sample-size` / `--sample-seed`) and logs the `question_id`s it drew, otherwise the next phase cannot honestly say "the same 20 questions". Reusable helpers accumulate in `scripts/exploration/_common.py` (`--dry-run` / `--resume` / `--checks` / `--caps`, `error_row()`, `EndpointCircuitBreaker`) and are promoted into `experiment/runner.py` at Phase 9 if they earn it, so the study does not end up with two logging systems.
-2. **A raw run directory** under `outputs/exploration/<phase>/<UTC-stamp>/` (gitignored, regenerable): `results.jsonl` — one row per question × model, keeping the `QuestionResult` field shape so `classify_failure()` reads exploratory data without a translation layer, and carrying that row's active `params` / resolved `min_chunks` / `max_retries` inline (open question 9); full chain-of-thought files for **every** row; and `context.md` recording git SHA, config snapshot, resolved `question_id`s and the baseline run id.
-3. **A findings entry** in tracked `experiments/<phase>/FINDINGS.md`: the numbers, the questions that failed *with the chain that shows why*, the decision each produced, and any open question it settled or moved. This is the only one of the three that survives a `--force` rebuild or a new machine, and it is what Phase 10 reads.
+| strategy | @5 | @10 | @20 | read it as |
+| --- | --- | --- | --- | --- |
+| `dense` | 40 | 55 | 65 | the only column that climbs |
+| `dense_rerank` | 45 | 45 | 45 | **capped-on-5**, not a plateau |
+| `hybrid` | 30 | 40 | 55 | fusion is losing to dense alone |
+| `hybrid_rerank` | 25 | 25 | 25 | capped, and on a worse list |
+| `bm25` | 0 | 0 | 10 | degenerate index, see R4 |
+
+`*_reform` columns from that run are **not** reformulation results: the rewrite
+fell back to the raw question on 18/20 questions, so the column copies `__orig`.
+n=20 means a 5 pp difference is one question — which is why R2 comes first.
 
 ## Phases
 
-**Phase 1 — Scaffold.** The project is a `src`-layout, pip-installable package (`pip install -e ".[dev]"`) named `medical_rag`, with a subpackage per pipeline stage (`data`, `retrieval`, `modules`, `generation`, `experiment`, `analysis`) and top-level `config/`, `scripts/`, `tests/`, gitignored `data/` and `outputs/`. `pyproject.toml` declares exact-pinned runtime and dev dependencies and configures pytest. A smoke test (`tests/test_pipeline.py`) confirms the package imports and exposes `__version__`.
-**COMPLETED**
+**R1 — Promote the harness.** *No new science.* Move the tuned tooling into the
+package, delete the cut scaffolding, make the grid and the shipped path share one
+code path, and introduce `retrieval.strategy.RetrievalStrategy` so a strategy means
+the same thing in a findings table as in a call.
+**Done.** Gate: `run_retrieval_grid.py --rerender outputs/exploration/retrieval_tuning/20260929T120215Z`
+rebuilds the committed `FINDINGS.md` **byte-identical** (proving the move carried no
+number), `.venv/bin/pytest` is green offline, and `sys.path.insert` is gone from
+`src/`, `scripts/` and `tests/`.
 
-**Phase 2 — Configuration and data loading.** `medical_rag.config.load_config()` loads and validates three YAML files (`config/default.yaml`, `models.yaml`, `conditions.yaml`) into a single `ExperimentConfig`, failing loudly if any condition references an undefined model. `load_medqa()` loads the 1,273-question MedQA-USMLE test set from Hugging Face (`GBaker/MedQA-USMLE-4-options`) into typed `MedQAQuestion` records. `load_statpearls()` builds the StatPearls corpus directly from its authoritative source — NCBI's raw NLM-XML archive plus a vendored, faithful port of MedRAG's own chunking algorithm — rather than relying on the official (empty) `MedRAG/statpearls` Hugging Face repo or unverified community mirrors, and caches the result locally after the first (~1.9GB) build.
-**COMPLETED**
+**R2 — Trust the oracle, then enlarge it.** The judge is ground truth per ADR-0008
+and unvalidated per `TUNING.md`; that inversion has to close before anything is
+believed. Stratified hand-check of ~30 verdicts *including the known-bad boilerplate
+chunks as controls*, reported per class rather than as one agreement percentage;
+silent-drop audit proving `judgments == candidates` per batch at full prose length;
+one rubric variant stored under its own sha to measure verdict stability; a test that
+gold answer text cannot reach the prompt. Then grow the pinned sample 20 → ~100 by
+containment and pay the judge calls once, resumable and circuit-breaker guarded.
+*Deliverable:* `experiments/retrieval/R2/FINDINGS.md` + the tracked oracle snapshot.
+**This phase spends real endpoint time — needs a go-ahead.**
 
-**Phase 3 — Retrieval.** `Embedder` wraps `BAAI/bge-small-en-v1.5` with BGE's asymmetric query/passage convention (an instruction prefix on queries only). `medical_rag.retrieval.index` builds and loads an exact-search LanceDB vector table. `Retriever` combines the two, plus a `cross-encoder/ms-marco-MiniLM-L-6-v2` reranker, into `retrieve()` + `rerank()`. `scripts/build_index.py` drives the whole load → embed → index → save pipeline from the command line. A real index exists on disk at `data/index/statpearls/`: 380,454 chunks from 9,652 StatPearls articles (NCBI's live corpus has grown since MedRAG's 301,202-snippet paper snapshot), embedded and indexed, manually verified against real MedQA questions to return topically relevant results.
-**COMPLETED**
+**R3 — Corpus ceiling.** `retrieval/ceiling.py` already exists and spends nothing:
+it pushes the gold option's own wording through a literal scan of all 380,454 chunk
+bodies and through `retrieve_base()`. Run it over the enlarged sample to separate
+*"exists, ranked #60"* from *"StatPearls never said it"*, and state the attainable
+ceiling for R4/R5. It uses the gold answer, so it is an oracle that stays out of
+every strategy table, and its bound is one-directional: 0 matches means *not in
+these words*, never *not in StatPearls*. Free, and it decides whether R4/R5 are
+chasing 25 points or 65.
 
-**Phase 4 — Generation client + prompts.** Implement `LLMClient` and the three prompt builders per `interfaces.md`. Files: `src/medical_rag/generation/llm.py`, `src/medical_rag/generation/prompt.py`, `tests/test_generation.py` (new). (./experiments/phase4/FINDINGS.md)
-**COMPLETED**
+**R4 — Fix the lexical index.** Tokenizer (medical terms, doses, numbers,
+stopwords, stemming), field weighting (title / contents / body), and excluding
+narrative case-report boilerplate. Give `retrieval/lexical.py` a real CLI — today it
+is reachable only as someone else's `--rebuild-bm25` — and write corpus + tokenizer
+version into the pickle so the 467 MB artifact stops being anonymous. *New tracked
+metric:* distinct chunks filling the top-5 (59/100 today), because fixing degeneracy
+has to be measurable even where recall barely moves.
 
-**Phase 5 — Closed-book generation smoke test.** Run `LLMClient` + `build_answer_prompt(context_chunks=None)` over 20 real MedQA questions from the dev split, one completion per model, thinking mode left at its default (on) for both models. Files: `scripts/exploration/closed_book.py`, `scripts/exploration/_common.py`, `experiments/phase5/FINDINGS.md` (all new, all tracked) — this phase's output is the evidence base for the Phase 10 freeze. `scripts/probe_models.py` stays the pre-flight for the endpoint/cost/recovery half (`.venv/bin/python scripts/probe_models.py`, exits non-zero if an endpoint is down or a fired recovery failed to produce an answer), but its four fixed probe questions are not a substitute for real MedQA items. (./experiments/phase5/FINDINGS.md)
+**R5 — Fusion and funnel shape.** RRF `k`, per-list cutoffs, dense/lexical
+weighting, rerank pool size, and where the funnel cuts — guided by the cap that made
+`dense_rerank` flat. Paired deltas with bootstrap CIs, which are offline and free, so
+a delta at n=100 is defensible rather than eyeballed.
 
-*Done*: the harness itself works — `scripts/exploration/closed_book.py`, `scripts/exploration/_common.py`, `tests/test_exploration_common.py` (`--dry-run` / `--resume` / `--checks` / `--caps`), with the sample pinned into `context.md`, every chain retained, and `params` snapshotted per result row. **The 20-question sample Phase 6 must reuse:** `1312 2391 3998 4002 5209 5949 6205 6264 6727 6753 6771 7159 7502 7553 8966 9293 9473 9572 9597 10064`. 
+**R6 — Freeze and deliver.** `scripts/eval_retrieval.py` is the single offline
+command; the frozen `retrieval:` block cites the R4/R5 measurement behind each value;
+the results doc is generated by the command rather than typed; index and BM25 pickle
+provenance recorded. `README.md` finally describes what the repo does.
 
-*Still open, and each one is a Phase 10/13 input rather than a blocker*: (i) **loop-aware recovery did not land** — recovery fired 0/40 because nothing came back unanswered, so `_recover_answer`'s loop replay is unexercised, not fixed; (ii) **the thinking budget's tail is unmeasured** — one chain reached 4,237 tokens, within 5% of 4,096, and at n=1,273 it may bind; (iii) the `--caps` pass is now optional, not required.
-**COMPLETED**
+*Sequencing is not a suggestion.* Do not start R4 with an unvalidated judge, and do
+not tune fusion before R4 stops returning the same five boilerplate chunks for every
+question — tuning a fusion over a degenerate input list measures the degeneracy.
 
-**Phase 6 — Raw RAG end-to-end.** Wires `Retriever` (Phase 3) + `LLMClient` (Phase 4) together manually, against the dev split, on Phase 5's pinned 20-question sample. Files: `scripts/exploration/raw_rag.py`, `experiments/phase6/FINDINGS.md` (new, tracked) — no other production files; same artifact convention.
+## Backlog, unscheduled
 
-*Diagnose*: pair each wrong answer against Phase 5’s row for the same `question_id`, labelling it “wrong closed-book too” vs. “right closed-book, wrong once context arrived”. That pairing is the seed data for Phase 12’s `distraction`/`over_reliance` categories, and the evidence the Phase 10 freeze needs for `min_chunks` and for how hard the prompt binds the model to the excerpts (see `build_answer_prompt` in `interfaces.md`).
-(./experiments/phase6/FINDINGS.md)
-**COMPLETED**
+Deliberately not phases, so they cannot quietly become one:
 
-**Phase 7 — Query reformulation.** Open by reading `experiments/retrieval_tuning/FINDINGS.md`'s semantic recall@k numbers — already re-derived against the tuned retriever by a judge model, not Phase 6's dense-only rows — rather than repeating the cruder string-match recount originally planned here. That recall ceiling, not the prompt, is what bounds what any rewrite can win. Only then implement `Reformulator` in `src/medical_rag/modules/reformulator.py` per `interfaces.md` (with `tests/test_reformulator.py` stubbing `LLMClient` over the success path and the fallback-to-original path, asserting the fallback is logged) and run it on the pinned 20. *Verify*: rewrites parse and stay on-topic; then **measure, do not assume, whether the rewrite retrieves better** — same questions with and without reformulation, same k and same reranker, changing only the query, comparing `gold_chunk_rank` and recall@k and logging every no-op and fallback. *Feeds*: Phase 10 (whether a reformulation condition survives the freeze).
-
-**Phase 8 — Answer verification.** Implement `Verifier` in `src/medical_rag/modules/verifier.py` per `interfaces.md` as a single batched call per question (with `tests/test_verifier.py` covering the normal filtering path and the `min_chunks` fallback path, asserting the fallback is logged with the question id), and test it against Phase 6's n=40 artifacts rather than by generating again — this phase should cost **zero completions** if Phase 6's artifacts are read properly. *Verify*: how many rows the verifier flips, and the false-rejection rate against answers already known to be correct. *Feeds*: Phase 10.
-
-*What Phase 6 hands over.* A verifier that checks whether the model's chosen option appears verbatim in the context would reject **32/40 rows (80%)**, correct answers included — these models answer from understanding, not string-matching. Judge the relation between answer and evidence, not surface form. Two more constraints: the failure profile is **model-specific** (a wrong answer alone means different things per arm), so classification and any verification policy must be conditioned on model; and because two of the four pilot cells sit at 20–25% accuracy, a verifier that deletes or rejects candidates has real headroom here, which is what makes this phase worth its cost.
-
-**Phase 9 — Experiment runner + pipeline.** Implement `src/medical_rag/experiment/conditions.py` and `experiment/runner.py` per `interfaces.md` (condition loop, checkpoint/resume, per-row logging, a per-endpoint `asyncio.Semaphore` gating in-flight requests — open question 12), wire `scripts/run_pilot.py` end-to-end, add `tests/test_pipeline_integration.py`, and run a small pilot over a few conditions before writing `experiments/phase9/FINDINGS.md`. Adopt `scripts/exploration/_common.py`'s row shape if it proves itself rather than inventing a second log format. Two things land here and nowhere else: **the concurrency sweep** (below) and **the `QuestionResult` schema decision** (open question 9), both of which Phase 10 needs as inputs. *Verify*: the pilot's rows reconcile against a manual count of the JSONL, and re-running after an interrupt does not re-call the LLM for already-logged questions. *Budget from Phase 6's realised medians — 6.1 s/question for `model_a`, 13.4 s for `model_b` with context — not from the harness's worst-case bound, which ran ~9× too pessimistic (38–76 min predicted for a run that took 8.5 min).* At those medians, one condition against both arms across all 1,273 test questions is ≈7 h of sequential generation, so a 4-condition design is a multi-day run before concurrency is measured — which is what makes the sweep load-bearing rather than optional.
-
-*Two measurement constraints this phase must respect.* Both arms are served by **one** oMLX process on `:8080` (preflight prints the same model list for both), so per-arm throughput is not free and `--concurrent-models` confounds it — sweep a per-endpoint semaphore (1/2/4) with both arms contending for that endpoint, and record wall-clock plus any collapse. And **`tok_s` is not decode speed**: it is `completion_tokens / wall_s`, and `wall_s` includes prefill, so the same endpoint reported 72.7 → 58.9 (`model_a`) and 73.5 → 64.4 (`model_b`) tok/s between closed-book and RAG conditions purely because prompt medians went 285 → 1,094. Fix prompt length when comparing tok/s, or log prefill separately — before this phase publishes any per-arm number.
-
-**Phase 10 — Design freeze.** Fix the condition set, prompt templates, `min_chunks`, sampling parameters, `max_retries`, verifier settings and the concurrency ceiling, using everything Phases 5–9 produced; write the choices into a frozen `config/conditions.yaml` (and `interfaces.md`, so the planned interfaces match what was actually chosen), record the rationale in `experiments/design.md`, and remove or disable every exploratory fallback — the pilot's circuit breaker, resume and no-op logging must behave identically under the frozen conditions. Every frozen value cites the finding that supports it (and the chain path where the finding is a chain), so the freeze is auditable rather than remembered. Phase 6 already pre-commits several of these (keep the cross-encoder, record both `vector_score` and `rerank_score`, ceilings unchanged).
-
-*This phase has one job beyond picking values: make the run reproducible.* Phase 5 run 2 moved 5/20 `model_a` answers — 50% → 70% — with nothing edited in this repo, because the endpoint's per-model sampling (`top_k=20`, `top_p=0.8`, `repetition_penalty=1.05`) lives outside git. A freeze that records only this repo's `params` would therefore be unreproducible, and open questions 9 and 14 are the same problem seen from two ends: the log must name every parameter that shaped the row, including the ones the server supplies.
-
-**Phase 11 — Metrics.** Implement `compute_accuracy`, `bootstrap_ci`, the finally-chosen primary significance test (open question 5) and `summarize_results` in `src/medical_rag/experiment/metrics.py`, with `tests/test_metrics.py` against small synthetic `QuestionResult` fixtures of known accuracy/delta. Depends on Phase 10, because the frozen contrasts determine which pairs are tested and the pilot's observed discordance is the input to the power calculation. *Feeds*: Phase 13.
-
-**Phase 12 — Failure taxonomy + reporting.** Implement `src/medical_rag/analysis/failure_taxonomy.py` and `report.py` so every Phase 13 row lands in exactly one of the seven `FailureCategory` values and `generate_report()` emits `summary.csv`/`summary.json` and at least one figure. Fit the heuristics to the failures already collected in `experiments/phase*/`, since those are the chains the confirmatory run will reproduce — not categories invented here — noting Phase 6's constraint that the failure profile is model-specific, that per-(condition, model) cells will be thin, and that thin cells are a reason to report margins over counts.
-
-**Phase 13 — Confirmatory run + `RESULTS.md`.** Implement `scripts/run_experiment.py` and run the frozen pipeline over the full 1,273-question test split — sampling seed pinned for question selection, generation left unseeded per [ADR-0003](./docs/adr/0003-drop-seed-one-completion-per-question.md) — resumable if interrupted, then write `RESULTS.md` with exact effect sizes and CIs for the frozen contrasts only (never any n=20 phase) and leave the repo in the state where `python scripts/build_index.py` and `python scripts/run_experiment.py` reproduce the whole study.
-
-## Next actions, in order
-
-1. **Retrieval tuning, then rerun Phase 6, then Phase 7.** Sequence:
-   - **Tuning** — build the judge harness and test retrieval candidates (BM25, hybrid, k, chunk filter, reranker, reformulation-as-retrieval)
-     against Phase 5's pinned 20. Side track, not a phase; see [`experiments/retrieval_tuning/TUNING.md`](./experiments/retrieval_tuning/TUNING.md).
-   - **Rerun Phase 6** end-to-end against the tuned retriever (~40 completions). The original Phase 6 run stays on disk as the dense-only baseline.
-   - **Then Phase 7** — reformulation on/off, compared against the *rerun*, not the original Phase 6.
-2. **The 4/20 string-match recall number is a floor, not the answer — the retrieval-tuning harness supersedes it.** At k=5 the gold option's exact wording reached the excerpts for only **4/20 questions (8/40 rows)**, so three quarters of Phase 6's rows never tested "model reading context" — they cannot distinguish *the model ignored the context* from *the context never had it*. Rather than recomputing this same string-match recount a second way inside Phase 7, `experiments/retrieval_tuning`'s judge harness re-derives it semantically (does a chunk *support* the gold option, not just contain its literal wording) across several retrieval levers at k=5/10/20; Phase 7 reads that FINDINGS.md before deciding whether reformulation has anything left to win.
-3. Add the **"answer only from the excerpts, and say which one"** condition to Phase 7's list — Phase 6's `q4002` pair (identical context, two invented bridges) and `q9572` (context ranked #2 argued it out of a correct answer) are the failures it targets.
-4. **Phase 8's judge must be semantic.** 32/40 rows — most of them *correct* — chose wording that appears nowhere in the excerpts, and 3 of 4 `rescued` rows argue against or outside their own answer, so a string-overlap support check would reject correct answers and pass invented bridges.
-5. **Keep the tree clean from here.** Phase 6 ran at `6079c13` with its own script and FINDINGS untracked, so that SHA identifies *around* the code rather than the code — the provenance caveat Phase 5 reproached run 1 for, recurring once. It is committed now (`dee8475`); Phase 7's run must record a SHA whose tree was clean, and the untracked `docs/adr/` needs committing with this plan.
-6. Then Phase 7 → 8 → 9, each with `audit_run.py` passing, before Phase 10.
+- **Chunking / corpus shape.** The only lever that can beat R3's ceiling, and it
+  costs the whole cache. See ADR-0009 before touching it; `data/chunking.py` waits
+  here for it.
+- **Reranker model, and `--rerank-with`.** A different cross-encoder is a bigger
+  claim than an RRF `k`, and the `rerank_with` knob (which string the reranker sees)
+  is a grid-only control that must never become a config field.
+- **Query-side rewrite.** The only retrieval lever that costs completions, and its
+  one honest result so far is +0/+0/+5 pp with 18/20 fallbacks. Code lives at
+  `eval/rewrite.py`; `experiments/retrieval_tuning/TUNING.md` explains why it was
+  not believed the first time.
+- **The cut answer-accuracy study.** Phases 7-13, `model_a`/`model_b`, the runner,
+  the statistics and the taxonomy — deleted, recoverable from git, with
+  [ADR-0007](./docs/adr/0007-retrieval-first-direction-change.md) as the argument
+  for the veto if it is ever revived.
 
 ## Open questions
 
-Numbering is stable and load-bearing: `interfaces.md` (`:243`, `:417`), `config/models.yaml` (`:54`), `tests/test_exploration_common.py` (`:332`), `scripts/exploration/closed_book.py` (`:32`, `:140`) and the phase `FINDINGS.md` files all cite these numbers, so the list below is deliberately not sequential — retired items keep their number and point at their ADR instead of being renumbered, and 15–16 were added by Phases 5–6. Items 1, 2, 8, 10, 11 and 13 are resolved — see [Decision record](#decision-record).
+Renumbered 1-6. The old numbering stops resolving on purpose: its load-bearing
+referents (`interfaces.md:243`, `:417`, `conditions.yaml`, the stubs) were deleted
+by R1. Mapping: old 4 → 6, old 5 → 2, old 7 → 5, old 16 → 4; old 3 and 15 went to
+the backlog, old 6, 9, 12 and 14 were cut with the study they were about (their
+"record every parameter that shaped the row" principle survives as the `context.md`
+rule).
 
-- **Question 3 — Reformulator retry policy.** How many validation retries before falling back to the original question, and should that fallback count toward a per-run failure-rate metric? Decidable at Phase 7, whose dry run produces the first no-ops.
-- **Question 4 — Resume/checkpoint mechanism.** `ExperimentRunner.run_condition()` must skip already-logged `(condition, question_id)` pairs on restart — decide whether that means re-reading the existing JSONL at startup (simple, but an O(n) reread every restart) or maintaining a separate lightweight manifest. Phase 6 sharpened the adjacent question: recovery correctness is now load-bearing, so what detects a partial row interrupted mid-write, and does resume replay per question or per condition × model? Decided at Phase 9.
-- **Question 5 — Primary significance test.** Phase 2's design review recommended replacing the spec's four-method stack (bootstrap CI + paired t-test + McNemar + factorial ANOVA) with one primary method plus bootstrap CIs as secondary presentation, tentatively McNemar — simple, pairwise, matching binary per-question outcomes — over a mixed-effects logistic regression, which handles the full factorial and question-level random effects in one model but is heavier to implement and explain. Confirm before Phase 11. Either way, the circuit breaker and errors produce missing rows, so paired tests run only over questions answered in both conditions and dropped pairs must be reported, not silently dropped.
-- **Question 6 — Failure taxonomy scope.** The spec asks for heuristics *and* manual review, with a CLI exporting a sample for labeling; decide whether manual labeling is in scope for this codebase at all, or whether `analysis/failure_taxonomy.py` ships heuristics-only and manual review is an out-of-band step. Settle it against the chains already collected in `experiments/phase*/`: if exploratory failures sort cleanly into the seven `FailureCategory` values, heuristics-only is defensible. Phase 6 attaches a constraint — the failure profile is model-specific (a wrong answer alone means different things per arm), so classification must be conditioned on model and not just on correctness, and pre-registered rather than fit on the same data it reports.
-- **Question 7 — StatPearls corpus size drift.** The built corpus has 380,454 chunks vs. MedRAG's documented 301,202 snippets (NCBI's live Bookshelf archive has grown since their paper snapshot). Decide whether `RESULTS.md` / `README.md` state this explicitly as a caveat against direct comparison with MedRAG's published numbers.
-- **Question 9 — `QuestionResult` doesn't snapshot active params.** It has no field echoing the `params` (or resolved `min_chunks` / `max_retries`) active for a logged row, so analysis joins back against `conditions.yaml` by `condition_id` — reliable only if that file is never edited after a run that produced already-logged results. The convention already requires exploratory rows to snapshot params inline; Phase 9 should carry it into the schema rather than decide it fresh, and **it must cover error rows too**: Phase 5's 17 `model_b` connection-error rows carried only 13 of 25 fields, so they were indistinguishable from rows produced under other settings. That harness gap is closed (`error_row()` now carries `params`); the production schema still has to decide.
-- **Question 12 — Concurrency in the Phase 9 runner.** One condition across both arms on the full test split is ≈7 h of sequential generation at Phase 6's realised medians, so days if awaited one at a time. Phase 4 found that passing `seed` disabled `mlx_lm.server`'s batching; `seed` is never sent now (ADR-0003) and that server has been replaced by oMLX, so the sweep must be re-measured from scratch. Corrected premise: the two arms **share one endpoint**, so per-endpoint semaphores buy fairness and bounded queues but not extra compute — measure per-endpoint concurrency 1/2/4 with both arms contending for `:8080`, record wall-clock and any throughput collapse in `experiments/phase9/FINDINGS.md`, and freeze the ceiling at Phase 10. Keep it configurable so a run's degree of parallelism is reproducible.
-- **Question 14 — The design freeze must snapshot the environment, not just the code.** The freeze records the git SHA on a clean tree, the frozen `conditions.yaml`, endpoint model ids *and the server-side settings applied to them* (see §Constraints), the retrieval artifacts (`chunks.jsonl` / `chunk_ids.json`) and prompt template hashes. Phase 5 run 1 and Phase 6 both ran against commits whose own scripts were untracked, so the recorded SHA identified *around* the code.
-- **Question 15 — Does query reformulation move retrieval recall at all?** `experiments/retrieval_tuning`'s reformulation-as-retrieval lever gives an early read on this — using the already-implemented `build_reformulation_prompt()` against the real retriever, before Phase 7 builds the full `Reformulator` module — and Phase 7's own recall recount confirms it. If neither shows a lift, dropping the reformulation condition at the Phase 10 freeze is the honest call rather than shipping a condition that only adds latency and a prompt.
-- **Question 16 — Two sampling knobs are unreproducible.** `model_a`'s published `generation_config.json` recommends `top_k=20` and `repetition_penalty=1.05`, and Phase 5 §8.4 found the endpoint applying them, while `LLMClient._complete()` sends only `max_completion_tokens` / `temperature` / `top_p`. Wiring them is a small `extra_body` passthrough — the same shape ADR-0004 decided *not* to need for thinking mode — not a config edit, and it is currently unscheduled. Until it lands, the frozen design cannot prove what it actually sent.
+- **1 — How reliable is the judge, where does it fail, and does it fail equally
+  across chunk classes?** R2 answers it. A single-model oracle errs systematically,
+  not randomly: leniency about boilerplate inflates every strategy's lexical recall
+  together and leaves the comparison looking clean. Decidable in R2.
+- **2 — What is the significance test for a paired recall delta?** Per-question
+  binary indicators, same questions both arms, so McNemar's exact test is the
+  candidate; bootstrap CIs for the marginal. Decidable in R5, where the first delta
+  worth defending is reported.
+- **3 — What is the verdict-cache growth policy, and what selection bias does it
+  encode?** The cache only contains chunks some strategy already retrieved, so it is
+  blind to candidates no strategy has ever surfaced. Grow-on-demand keeps it cheap
+  and keeps it biased; a random-pool sample per question would cost judge time to
+  fix a bias nobody has yet sized.
+- **4 — What does the endpoint actually apply to `judge_model`?** `LLMClient` sends
+  only `max_completion_tokens`/`temperature`/`top_p`; per-model `top_k` and
+  `repetition_penalty` live in `~/.omlx/model_settings.json`, outside git. For an
+  answer that was one reproducibility bug (old question 16); for the oracle it is a
+  validity bug. R2 records the values next to the snapshot; whether to send them
+  deliberately stays open.
+- **5 — Do we state the corpus-size drift?** 380,454 chunks vs MedRAG's documented
+  301,202 snippets (NCBI's live archive grew since their snapshot). Decide whether
+  `README.md` flags it as a caveat against comparing with published numbers. Cheap;
+  should be yes, and R6 is when the README gets written anyway.
+- **6 — Resume semantics for a ~100-question cache build.** Per-question commit is
+  what `RunWriter` does today and it is enough, but the cache append is not
+  transactional: a crash mid-line leaves a torn record that `load_cache` skips.
+  Decide whether that is acceptable (cost: one re-asked batch) or whether the cache
+  gets a rewrite-in-place compaction step.
 
 ## Decision record
 
-Six decisions that used to be argued in this file now live in [`docs/adr/`](./docs/adr/README.md) with their context and consequences. `interfaces.md` and the phase `FINDINGS.md` files reference the old numbers, so the mapping below is what makes those references still resolve.
+Nine decisions that were argued out in earlier drafts live in
+[`docs/adr/`](./docs/adr/README.md). The mapping below is what makes the old
+question numbers in `interfaces.md` and the phase `FINDINGS.md` files still resolve.
 
-| Old question | Decision | ADR |
-| --- | --- | --- |
-| 1 — real model endpoints | Two OpenAI-compatible endpoints from `config/models.yaml`, now served by one local oMLX server on `:8080`; keys stay env-var placeholders, never committed | [0001](./docs/adr/0001-real-model-endpoints.md) |
-| 2 — what "two models" means | An instruct/reasoning pair (`model_a` = Qwen2.5-7B-Instruct, `model_b` = DeepSeek-R1-Distill-Qwen-7B), so the model factor is estimable and the interaction survives the freeze | [0002](./docs/adr/0002-instruct-reasoning-model-pair.md) |
-| 8 + 13 (ceiling half) — token caps and sampling parameters | `model_a` stays at **1,024**; `model_b` **16,384 → 8,096** (worst case used 50% / 52% of cap, 0/40 `finish_reason="length"`, ceilings survived +822 prompt tokens of context); `temperature`/`top_p` are each model's published defaults (`0.7`/`0.8` and `0.6`/`0.95`), not placeholders | [0006](./docs/adr/0006-token-ceilings-and-sampling-params.md) |
-| 10 — does `seed` change anything? | `seed` was measured inert, so the parameter is deleted rather than defaulted and the study runs **one completion per question per condition**; variance moves to sampling `temperature`, held equal across conditions | [0003](./docs/adr/0003-drop-seed-one-completion-per-question.md) |
-| 11 — thinking mode | Fixed **on** for both arms, no toggle and no `ModelConfig` field: `chat_template_kwargs.thinking` is a hybrid-reasoning template feature `model_a` does not have, so an on/off factor would be asymmetric and require an extra `:8081` instance to stay fair | [0004](./docs/adr/0004-thinking-mode-fixed-on.md) |
-| 13 — `model_b` does not terminate | Closed **endpoint-side**: oMLX applies a 4,096-token thinking budget and `top_k=40` to `model_b`, so the loop is bounded by decoding rather than by a bigger cap. Consequences: the repo no longer controls whether `model_b` answers at all, the `extra_body` passthrough is now for reproducibility instead of termination, and loop-aware recovery is *unexercised*, not fixed | [0005](./docs/adr/0005-model-b-termination-endpoint-side.md) |
+| ADR | Decision | Was | Status |
+| --- | --- | --- | --- |
+| [0001](./docs/adr/0001-real-model-endpoints.md) | Real OpenAI-compatible endpoints (`:8080` oMLX), keys only ever env-var placeholders | old item 1 | Accepted |
+| [0002](./docs/adr/0002-instruct-reasoning-model-pair.md) | Instruct/reasoning pair `model_a`/`model_b` | old item 2 | Partially superseded by 0007 |
+| [0003](./docs/adr/0003-drop-seed-one-completion-per-question.md) | `seed` measured inert, so deleted; one completion per question | old item 10 | Accepted |
+| [0004](./docs/adr/0004-thinking-mode-fixed-on.md) | Thinking mode fixed on, no toggle | old item 11 | Accepted |
+| [0005](./docs/adr/0005-model-b-termination-endpoint-side.md) | `model_b` non-termination fixed endpoint-side | old item 13 | Accepted (recovery half unresolved) |
+| [0006](./docs/adr/0006-token-ceilings-and-sampling-params.md) | Token ceilings and published sampling defaults | old item 8 | Scoped to frozen tooling by 0007 |
+| [0007](./docs/adr/0007-retrieval-first-direction-change.md) | Retrieval-first; Phases 7-13 cut, not deferred | the direction change | Accepted |
+| [0008](./docs/adr/0008-judge-cache-as-ground-truth.md) | The judge cache is the ground truth | `TUNING.md`'s open question | Accepted (R2 validates it) |
+| [0009](./docs/adr/0009-corpus-and-chunking-frozen.md) | Corpus + chunking frozen; dead chunk keys deleted not wired | implicit until now | Accepted |
 
-Decisions settled before Phase 5 — exact search rather than an ANN index at this corpus size, the 20 → 5 rerank funnel and keeping the cross-encoder, the prompt template, `min_chunks` — live in [`interfaces.md`](./interfaces.md) and the `retrieval:` / `verifier:` blocks of `config/default.yaml`, and are not re-litigated here.
+## Where the evidence lives
+
+- [`experiments/retrieval_tuning/FINDINGS.md`](./experiments/retrieval_tuning/FINDINGS.md)
+  — the one grid run, frozen. [`TUNING.md`](./experiments/retrieval_tuning/TUNING.md)
+  is the harness's method doc.
+- [`experiments/phase5/FINDINGS.md`](./experiments/phase5/FINDINGS.md) and
+  [`experiments/phase6/FINDINGS.md`](./experiments/phase6/FINDINGS.md) — closed-book
+  and raw-RAG baselines on the pinned 20, frozen. They are the *reason* for this
+  direction, not results in it.
+- `experiments/retrieval/R*/FINDINGS.md` — where R2-R6 land
+  ([convention](./experiments/README.md)). Raw run dirs stay gitignored under
+  `outputs/exploration/`.
+- [`refactor_plan.md`](./refactor_plan.md) — the R1 refactor's own plan, kept as the
+  audit trail for what moved and what was deleted.
 
 ## Related docs
 
-- [environment.md](./environment.md) — runtimes, versions, required env vars, local setup steps.
-- [file_layout.md](./file_layout.md) — directory tree, module boundaries, conventions.
-- [interfaces.md](./interfaces.md) — public contracts: type signatures, invariants, stability notes.
-- [docs/adr/README.md](./docs/adr/README.md) — decision record index (ADR-0001…0006); [experiments/README.md](./experiments/README.md) — per-phase evidence rules.
+- [file_layout.md](./file_layout.md) — the tree, module boundaries, the two import rules.
+- [interfaces.md](./interfaces.md) — public contracts: signatures, invariants, stability.
+- [environment.md](./environment.md) — runtimes, versions, env vars, setup.
+- [docs/adr/README.md](./docs/adr/README.md) — decision record index (ADR-0001…0009).

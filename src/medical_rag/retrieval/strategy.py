@@ -1,6 +1,6 @@
 """The retrieval-strategy grid: five strategies x two query variants.
 
-`judge_harness.py` and `inspect_retrieval.py` both import this module, so the
+`eval/harness.py` and `eval/inspector.py` both import this module, so the
 number in `FINDINGS.md` and the cell a human reads in the browser are computed
 by the same function. Otherwise a viewer quietly drifts from the table it is
 meant to explain.
@@ -28,18 +28,17 @@ run across the two settings.
 from __future__ import annotations
 
 import asyncio
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
-from medical_rag.retrieval.retriever import RetrievedChunk
+from loguru import logger
 
-_HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
-
-from hybrid import rrf_fuse  # noqa: E402
+from medical_rag.config import ExperimentConfig
+from medical_rag.retrieval.embedder import Embedder
+from medical_rag.retrieval.fusion import rrf_fuse
+from medical_rag.retrieval.index import load_index
+from medical_rag.retrieval.retriever import Retriever, RetrievedChunk
 
 BASE_STRATEGIES: tuple[str, ...] = (
     "dense",
@@ -160,6 +159,7 @@ def retrieve_base(
     top_k: int,
     rerank_k: int,
     bm25_top_k: int | None = None,
+    rrf_k: int | None = None,
     rerank_query: str | None = None,
 ) -> dict[str, list[RetrievedChunk]]:
     """The five strategy lists for one query string.
@@ -170,11 +170,19 @@ def retrieve_base(
     rather than mutating, so the same objects are safe to share. `bm25_top_k`
     defaults to `top_k`; raising it is a lever, not a fix, and the first run's
     `bm25` recall@20 of 10% is the reason the knob exists at all.
+
+    `rrf_k=None` defers to `fusion.rrf_fuse()`'s own default rather than
+    restating it here, so the grid and the fusion module cannot disagree about
+    what the unconfigured value is.
     """
     scored_query = query if rerank_query is None else rerank_query
     dense = retriever.retrieve(query, top_k)
     lexical = bm25_index.search(query, bm25_top_k or top_k)
-    hybrid = rrf_fuse(dense, lexical, top_k=top_k)
+    hybrid = (
+        rrf_fuse(dense, lexical, top_k=top_k)
+        if rrf_k is None
+        else rrf_fuse(dense, lexical, top_k=top_k, k=rrf_k)
+    )
     return {
         "dense": dense,
         "dense_rerank": retriever.rerank(scored_query, dense, rerank_k),
@@ -194,6 +202,7 @@ def retrieve_grid(
     top_k: int,
     rerank_k: int,
     bm25_top_k: int | None = None,
+    rrf_k: int | None = None,
     rerank_with: str = "question",
 ) -> GridResult:
     """Every cell of the grid. Blocks; call `aretrieve_grid()` from async code.
@@ -221,6 +230,7 @@ def retrieve_grid(
             top_k=top_k,
             rerank_k=rerank_k,
             bm25_top_k=bm25_top_k,
+            rrf_k=rrf_k,
             rerank_query=rerank_query,
         ).items():
             result.lists[method_id(base, variant)] = chunks
@@ -262,4 +272,151 @@ def prerank_map(method: str, lists: dict[str, list[RetrievedChunk]]) -> dict[str
     if source is None:
         return {}
     return {chunk.chunk_id: rank for rank, chunk in enumerate(source, start=1)}
+
+
+# --- wiring the shipped path --------------------------------------------------
+#
+# `resolve_index_dir()` and `build_retriever()` moved here from
+# `scripts/exploration/raw_rag.py`. They lived there, which meant the retrieval
+# harness reached its measurement machinery through a Phase 6 answer-accuracy
+# script: moving either one broke the other, and the only thing holding the
+# arrangement together was a `sys.path.insert`. `raw_rag.py` now imports them
+# back, so the frozen Phase 6 tooling still runs and the dependency points one
+# way -- scripts depend on the package, never the reverse.
+
+
+def resolve_index_dir(
+    config: ExperimentConfig, index_dir: str | Path | None = None
+) -> Path:
+    """Where the LanceDB table lives, given `--index-dir` or the config's corpus.
+
+    `RetrievalConfig` names a `corpus`, not a directory, so the mapping is here
+    rather than in the config -- but it is one function used by both the plan
+    print and the loader so the number in `context.md` cannot disagree with the
+    table actually queried.
+    """
+    if index_dir:
+        return Path(index_dir)
+    return Path("data/index") / config.retrieval.corpus
+
+
+def build_retriever(
+    config: ExperimentConfig, index_dir: str | Path | None = None
+) -> tuple[Retriever, dict[str, Any]]:
+    """Load the built index and wire a retriever onto it.
+
+    Returns the retriever and the *static* retrieval fields every row of a run
+    shares -- index path, row count, the two encoder names, the device. Taken
+    once here rather than re-read per question, because `Embedder` exposes no
+    `model_name` attribute and a row that silently recorded `None` for the
+    embedding model would look like a config change rather than a missing getter.
+
+    Nothing here rebuilds anything: a silently rebuilt index would be a second,
+    invisible variable under a run whose whole claim is a delta.
+    """
+    path = resolve_index_dir(config, index_dir)
+    if not path.exists():
+        raise SystemExit(
+            f"no index at {path} -- run .venv/bin/python scripts/build_index.py first "
+            "(environment.md §5.1: the index is built once and reused by every phase)"
+        )
+    table = load_index(path)
+    retriever = Retriever(
+        Embedder(model_name=config.retrieval.embedding_model),
+        table,
+        config.retrieval.reranker_model,
+    )
+    static = {
+        "index_dir": str(path),
+        "index_rows": table.count_rows(),
+        "embedding_model": config.retrieval.embedding_model,
+        "reranker_model": config.retrieval.reranker_model,
+        "device": retriever.embedder.device,
+    }
+    logger.bind(kind="retrieval").info(
+        "retriever ready: {} rows from {} on {} ({})",
+        static["index_rows"],
+        static["index_dir"],
+        static["device"],
+        static["embedding_model"],
+    )
+    return retriever, static
+
+
+@dataclass(frozen=True)
+class RetrievalStrategy:
+    """One shippable retrieval configuration, resolved from `RetrievalConfig`.
+
+    The point of this type is that the grid and the shipped path call the same
+    `retrieve_base()`, so `hybrid` means one thing in `FINDINGS.md` and in a
+    production call. Before it existed, the strategy composition lived only in
+    the harness and the production path was whatever `raw_rag.py` happened to do
+    -- which is how a table of measured strategies could drift from the thing
+    any later phase would actually run.
+
+    The grid's `rerank_with` knob is deliberately absent: it exists to isolate
+    the embedding step from the reranker's string when two query variants are
+    compared. With one query there is one string, and a config field that only
+    sometimes applies is a field that lies.
+    """
+
+    name: str = "dense_rerank"
+    top_k: int = 20
+    rerank_k: int = 5
+    bm25_top_k: int = 20
+    rrf_k: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.name not in BASE_STRATEGIES:
+            raise ValueError(
+                f"unknown retrieval strategy {self.name!r} "
+                f"(known: {', '.join(BASE_STRATEGIES)})"
+            )
+        if self.top_k < 1:
+            raise ValueError(f"top_k must be >= 1, got {self.top_k}")
+        # A `*_rerank` strategy whose funnel is wider than its input list is not
+        # a wider funnel, it is the input list -- and a table that reports
+        # recall@20 for a 5-chunk list reads like a plateau rather than a cap.
+        if self.name.endswith("_rerank") and self.rerank_k > self.top_k:
+            raise ValueError(
+                f"{self.name}: rerank_k={self.rerank_k} exceeds top_k={self.top_k}; "
+                f"the reranker can only order the {self.top_k} candidates it is given"
+            )
+
+    @classmethod
+    def from_config(
+        cls, config: ExperimentConfig, name: str | None = None
+    ) -> "RetrievalStrategy":
+        """Resolve from `config.retrieval`, with `--strategy` allowed to override the name."""
+        retrieval = config.retrieval
+        return cls(
+            name=name or retrieval.strategy,
+            top_k=retrieval.top_k_retrieve,
+            rerank_k=retrieval.top_k_rerank,
+            bm25_top_k=retrieval.bm25_top_k,
+            rrf_k=retrieval.rrf_k,
+        )
+
+    def lists(
+        self,
+        query: str,
+        retriever: Any,
+        bm25_index: Any,
+    ) -> dict[str, list[RetrievedChunk]]:
+        """Every strategy list this configuration computes, for one query."""
+        return retrieve_base(
+            query,
+            retriever,
+            bm25_index,
+            top_k=self.top_k,
+            rerank_k=self.rerank_k,
+            bm25_top_k=self.bm25_top_k,
+            rrf_k=self.rrf_k,
+        )
+
+    def retrieve(
+        self, query: str, retriever: Any, bm25_index: Any
+    ) -> list[RetrievedChunk]:
+        """This strategy's ranked list for one query."""
+        return self.lists(query, retriever, bm25_index)[self.name]
 

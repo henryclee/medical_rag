@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "medical-rag"
 version = "0.1.0"
-description = "Medical RAG research pipeline experiment."
+description = "Retrieval optimization for MedQA-USMLE over StatPearls, scored offline by a versioned judge-verdict cache."
 requires-python = ">=3.11"
 dependencies = [
     "pydantic-ai==2.48.0",

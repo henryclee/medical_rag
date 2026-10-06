@@ -2,9 +2,12 @@
 # variable to read the API key from; no secrets are stored here -- put the
 # keys in the repo's gitignored .env (see .env.example).
 #
-# The two entries are genuinely different models (measured live in Phase 4):
-# an instruct model and a reasoning model, which is what the `model` factor in
-# conditions.yaml needs.
+# The mainline -- every retrieval measurement in this repo -- uses judge_model
+# and nothing else. model_a and model stay because the frozen Phase 5/6 answer
+# scripts (scripts/exploration/) are still runnable evidence tooling and read
+# these two entries; they are not part of any scheduled experiment. Measured
+# live in Phase 4 as a genuinely different pair: one instruct model, one
+# reasoning model.
 #
 # ONE SERVER SERVES BOTH. Since the run below, both arms point at one oMLX
 # instance (omlx-server, :8080) that pools 12 models, not at two mlx_lm.server
@@ -53,6 +56,8 @@
 # repetition_penalty to 0.0 (off), so it is the blocking path for model_b's
 # repetition loops (open question 13).
 models:
+  # model_a / model_b: frozen Phases 5-6 answer tooling. Not used by retrieval
+  # measurement; kept so those runs can be reproduced.
   model_a:
     name: model_a
     base_url: "http://localhost:8080/v1"
@@ -75,6 +80,11 @@ models:
     timeout: 300.0
     max_retries: 1
     answer_recovery_max_tokens: 512
+  # judge_model: THE ORACLE (ADR-0008). Every recall number in this repo is an
+  # arithmetic consequence of what this model said about a chunk, so changing
+  # its id, its endpoint-side sampling, or its rubric invalidates the verdict
+  # cache -- the rubric sha guards the last one, nothing guards the first two.
+  # temperature 1.0 is therefore a load-bearing value, not a stylistic one.
   judge_model:
     name: judge_model
     base_url: "http://localhost:8080/v1"

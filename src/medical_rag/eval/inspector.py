@@ -3,24 +3,24 @@
     set -a; source .env; set +a
 
     # read an already-judged run: no embedder, no BM25 pickle, no requests
-    .venv/bin/python experiments/retrieval_tuning/inspect_retrieval.py \\
+    .venv/bin/python scripts/inspect_retrieval.py \\
         --from-run outputs/exploration/retrieval_tuning/20260929T120215Z --open
 
     # one question, live: retrieve the 5x2 grid, judge only unseen chunks
-    .venv/bin/python experiments/retrieval_tuning/inspect_retrieval.py --question-id 1312
+    .venv/bin/python scripts/inspect_retrieval.py --question-id 1312
 
     # tweak the reformulation lever without paying for the reformulation
-    .venv/bin/python experiments/retrieval_tuning/inspect_retrieval.py \\
+    .venv/bin/python scripts/inspect_retrieval.py \\
         --question-id 1312 --query 'chronic pancreatitis with steatorrhea from duct obstruction'
 
     # keep the embedder and BM25 loaded, poke at several questions
-    .venv/bin/python experiments/retrieval_tuning/inspect_retrieval.py --repl
+    .venv/bin/python scripts/inspect_retrieval.py --repl
 
     # the same loaded state, driven from the browser instead of the terminal
-    .venv/bin/python experiments/retrieval_tuning/inspect_retrieval.py --serve
+    .venv/bin/python scripts/inspect_retrieval.py --serve
 
     # browse yesterday's verdicts with nothing loaded at all
-    .venv/bin/python experiments/retrieval_tuning/inspect_retrieval.py --serve --no-retrieve \
+    .venv/bin/python scripts/inspect_retrieval.py --serve --no-retrieve \
         --from-run outputs/exploration/retrieval_tuning/grid_smoke_check
 
 Why: `FINDINGS.md` claims `dense` reached 65% and `bm25` 10%. Those numbers are
@@ -41,7 +41,7 @@ Three modes, deliberately different costs:
   for `(question, chunk)` pairs missing from `judge_cache/judged_chunks.jsonl`.
   Re-inspecting a question you looked at yesterday is free; the first look costs
   one judge batch per ~24 new chunks.
-* **served** (`--serve`) -- the live world behind a localhost form (see `serve.py`),
+* **served** (`--serve`) -- the live world behind a localhost form (see `eval/lab.py`),
   for when the reading is the point: the knob you want to move and the 40 chunk
   bodies you want to read were in different windows, and `render_terminal` truncates
   bodies to 110 chars on its way to saying so. Loads once, then a knob change is one
@@ -60,7 +60,6 @@ import argparse
 import asyncio
 import hashlib
 import json
-import sys
 import webbrowser
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -76,31 +75,9 @@ from medical_rag.generation.llm import LLMClient, LLMError
 from medical_rag.retrieval.index import load_index
 from medical_rag.retrieval.retriever import RetrievedChunk
 
-_HERE = Path(__file__).resolve().parent
-_REPO_ROOT = _HERE.parents[1]
-for _path in (_HERE, _REPO_ROOT / "scripts" / "exploration"):
-    if str(_path) not in sys.path:
-        sys.path.insert(0, str(_path))
-
-from _common import (  # noqa: E402
-    DEFAULT_RUN_ROOT,
-    EndpointCircuitBreaker,
-    _unique_dir,
-    parse_notes,
-    select_by_ids,
-)
-from bm25_index import DEFAULT_BM25_PATH, load_or_build_bm25_index  # noqa: E402
-from chunk_store import resolve_chunks, write_chunks  # noqa: E402
-from judge_cache import DEFAULT_JUDGE_CACHE, ensure_verdicts, load_cache  # noqa: E402
-from judge_prompt import judge_prompt_sha  # noqa: E402
-from raw_rag import Preflight, build_retriever, preflight, resolve_index_dir  # noqa: E402
-from reformulate import (  # noqa: E402
-    ReformulationResult,
-    load_template,
-    manual_result,
-    reformulate_query,
-)
-from render import (  # noqa: E402
+from medical_rag.eval.judge import DEFAULT_JUDGE_CACHE, ensure_verdicts, load_cache
+from medical_rag.eval.rubric import judge_prompt_sha
+from medical_rag.eval.report import (
     QuestionView,
     build_question_view,
     render_html,
@@ -108,7 +85,27 @@ from render import (  # noqa: E402
     render_terminal,
     view_from_row,
 )
-from strategies import aretrieve_grid  # noqa: E402
+from medical_rag.eval.rewrite import (
+    ReformulationResult,
+    load_template,
+    manual_result,
+    reformulate_query,
+)
+from medical_rag.eval.runlog import (
+    DEFAULT_RUN_ROOT,
+    EndpointCircuitBreaker,
+    _unique_dir,
+    parse_notes,
+    select_by_ids,
+)
+from medical_rag.eval.store import resolve_chunks, write_chunks
+from medical_rag.generation.preflight import Preflight, preflight
+from medical_rag.retrieval.lexical import DEFAULT_BM25_PATH, load_or_build_bm25_index
+from medical_rag.retrieval.strategy import (
+    aretrieve_grid,
+    build_retriever,
+    resolve_index_dir,
+)
 
 PHASE = "retrieval_tuning"
 CONDITION_ID = "retrieval_inspection"
@@ -149,8 +146,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     modes.add_argument(
         "--serve", action="store_true",
         help="serve the grid on http://HOST:PORT and drive this process from the browser. "
-        "Same loaded state as --repl (pay the ~40s load once) with the reading surface "
-        "you actually read it in; see serve.py. Mutually exclusive with --repl",
+        "Same loaded state as --repl (about 4 s of loads, once) with the reading surface "
+        "you actually read it in; see eval/lab.py. Mutually exclusive with --repl",
     )
     modes.add_argument("--host", default="127.0.0.1", help="--serve bind address (default: localhost only)")
     modes.add_argument(
@@ -174,7 +171,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     grid.add_argument(
         "--rerank-with", choices=("question", "reform"), default="question",
         help="which string the cross-encoder sees; 'question' keeps the reform column a "
-        "single-variable change (see strategies.py)",
+        "single-variable change (see retrieval/strategy.py)",
     )
     grid.add_argument("--k", nargs="*", type=int, default=list(K_DEFAULT), help="k values")
     grid.add_argument("--index-dir", default=None, help="LanceDB index directory")
@@ -268,7 +265,7 @@ def custom_question(args: argparse.Namespace) -> MedQAQuestion | None:
         options=options,
         answer_idx=gold,
         answer_text=options[gold],
-        meta_info="ad-hoc question typed into inspect_retrieval.py",
+        meta_info="ad-hoc question typed into eval/inspector.py",
     )
 
 
@@ -281,7 +278,7 @@ def resolve_target_questions(
     subset that resolved -- a page for 18 of 20 pinned questions that looks
     complete is the failure mode this repo has already paid for twice.
     """
-    from judge_harness import SAMPLE_QUESTION_IDS  # noqa: PLC0415 - import stays local
+    from medical_rag.eval.harness import SAMPLE_QUESTION_IDS  # noqa: PLC0415 - import stays local
 
     targets: list[MedQAQuestion] = []
     ids = list(args.question_id)
@@ -322,7 +319,7 @@ def row_from_view(view: QuestionView) -> dict[str, Any]:
     """A harness-shaped row, so an inspection is greppable like a run.
 
     Method keys are grid ids and `judgments` holds the verdicts actually shown, so
-    `judge_cache.py --import-run` can re-import an inspection dir. `question` and
+    `eval/judge.py --import-run` can re-import an inspection dir. `question` and
     `options` are included on purpose -- their absence is what made the first
     run's rows unreadable by anything but the dataset that produced them.
     """
@@ -419,9 +416,16 @@ class Inspector:
     """The loaded world: index, BM25, judge client, verdict cache, out dir.
 
     Constructed once and reused -- by a one-shot run and by every turn of the
-    REPL. The REPL exists because `Embedder`, the cross-encoder and the 467 MB
-    BM25 pickle load in ~40 s while one grid takes ~2 s: re-running the script per
-    guess pays the expensive part to exercise the cheap one.
+    REPL. The REPL exists because the load and the grid cost different orders of
+    magnitude. Measured on MPS, k=20 -> rerank 5, 2026-10-05, warm page cache:
+    dataset 0.9 s, index + embedder + cross-encoder 1.3 s, the 445 MB BM25 pickle
+    1.7 s -- **~4 s of loads** -- against **~10 s for one five-strategy grid**
+    (median 10.6 s, 5.5-19.7 s over n=9). So re-running the script per guess pays
+    ~4 s every time to re-do work the process already had, while the ~10 s you
+    actually want to repeat is free to repeat. (A cold page cache makes the pickle
+    the slow one; the ratio, not the absolute, is what the REPL is for. This
+    docstring claimed "~40 s load / ~2 s grid" for a while, which had the ratio
+    exactly inverted -- see `experiments/retrieval_tuning/TUNING.md`.)
     """
 
     def __init__(self, args: argparse.Namespace, config: Any) -> None:
@@ -526,7 +530,7 @@ class Inspector:
 
         `query_override` is the REPL's per-turn hand-written information need; it
         takes precedence over `--query` and over the reformulator, so a tweak costs
-        a retrieval pass (~2 s) instead of a generation (~20 s) -- and it can never
+        one retrieval pass (~10 s) instead of a generation (~20 s) -- and it can never
         silently fall back, which is the whole point of the manual path.
         """
         assert self.retriever is not None and self.bm25 is not None, "open(retrieval=True) first"
@@ -950,9 +954,9 @@ def serve_main(args: argparse.Namespace) -> int:
         )
         return 0
 
-    from serve import serve
+    from medical_rag.eval.lab import serve
 
-    from judge_harness import SAMPLE_QUESTION_IDS  # noqa: PLC0415 - as in resolve_target_questions
+    from medical_rag.eval.harness import SAMPLE_QUESTION_IDS  # noqa: PLC0415 - as in resolve_target_questions
 
     # `--no-retrieve` implies no judging: with nothing to retrieve there are no new
     # chunks to grade, and loading the client would run preflight -- a real

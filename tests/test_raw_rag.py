@@ -20,8 +20,9 @@ the comparison, not the generation:
 `run_question()` itself is not tested: it is glue around these helpers and the
 live smoke run (`--limit 2`) exercises it against a real endpoint.
 
-Loaded by path, the way `test_exploration_common.py` loads `_common.py` --
-`scripts/` is deliberately not an importable package.
+Loaded by path -- `scripts/` is deliberately not an importable package -- but it
+needs no `sys.path` hack any more: since R1 its helpers (`eval.runlog`,
+`generation.preflight`, `retrieval.strategy`) are ordinary package imports.
 """
 
 import argparse
@@ -35,13 +36,7 @@ from typing import Any
 
 import pytest
 
-from medical_rag.config import (
-    ExperimentConfig,
-    ModelConfig,
-    ReformulatorConfig,
-    RetrievalConfig,
-    VerifierConfig,
-)
+from medical_rag.config import ExperimentConfig, ModelConfig, RetrievalConfig
 from medical_rag.data.load_medqa import MedQAQuestion
 from medical_rag.retrieval.retriever import RetrievedChunk
 
@@ -55,10 +50,6 @@ def raw_rag():
     """Load `raw_rag.py` once per module, by file path."""
     if _MODULE_NAME in sys.modules:
         return sys.modules[_MODULE_NAME]
-    scripts_dir = str(_PATH.parent)
-    if scripts_dir not in sys.path:
-        # `raw_rag.py` imports its shared helpers as `from _common import ...`.
-        sys.path.insert(0, scripts_dir)
     spec = importlib.util.spec_from_file_location(_MODULE_NAME, _PATH)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -87,15 +78,11 @@ def _config(**overrides) -> ExperimentConfig:
         "retrieval": RetrievalConfig(
             corpus="statpearls",
             embedding_model="embed-model",
-            chunk_size=512,
-            chunk_overlap=64,
+            strategy="dense_rerank",
             top_k_retrieve=10,
             top_k_rerank=3,
             reranker_model="rerank-model",
         ),
-        "verifier": VerifierConfig(min_chunks=2),
-        "reformulator": ReformulatorConfig(max_retries=2),
-        "conditions": [],
         "benchmark": "medqa",
         "dev_split": "dev",
         "test_split": "test",

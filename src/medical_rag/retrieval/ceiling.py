@@ -13,11 +13,11 @@ the two cases those are.
 Two halves, both free of completions:
 
 * **containment scan** -- a literal substring search over all 380,454 chunk
-  bodies, which the BM25 index already holds in memory (`bm25_index.BM25Index`
+  bodies, which the BM25 index already holds in memory (`lexical.BM25Index`
   keeps parallel `chunk_ids`/`titles`/`contents` lists), so this costs no LanceDB
   scan and no model load beyond the pickle.
 * **oracle retrieval** -- the *gold option text* used as the query through
-  `strategies.retrieve_base()`. If a query that literally contains the answer
+  `strategy.retrieve_base()`. If a query that literally contains the answer
   cannot surface a chunk that literally contains it, the bottleneck is the index,
   not the phrasing.
 
@@ -43,8 +43,7 @@ from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from medical_rag.retrieval.retriever import RetrievedChunk
-
-from strategies import BASE_STRATEGIES, retrieve_base
+from medical_rag.retrieval.strategy import BASE_STRATEGIES, retrieve_base
 
 ORACLE_LABEL = (
     "oracle: the query contains the gold answer -- a diagnostic ceiling, "

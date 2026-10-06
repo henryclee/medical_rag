@@ -1,5 +1,6 @@
-"""Tests for scripts/exploration/_common.py -- the sample pinning and the
-artifact writer that Phases 5-9 all log through.
+"""Tests for medical_rag.eval.runlog (moved from scripts/exploration/_common.py
+in R1) -- the sample pinning and the artifact writer that Phases 5-9 all logged
+through.
 
 These are the pieces an exploratory finding rests on, and both fail *silently*:
 a sample-selection function that drifts across environments breaks the
@@ -7,15 +8,14 @@ a sample-selection function that drifts across environments breaks the
 that drops rows breaks `--resume` in a way that is only discovered an hour into
 a run. The rest of `scripts/` is plain CLI wiring and is exercised by hand.
 
-Loaded by path rather than imported: `scripts/` is deliberately not an importable
-package (see `_common.py`'s docstring -- nothing in `medical_rag` may depend on
-it), so the test reaches in without teaching the package about it.
+It used to be loaded by file path, because `scripts/` is deliberately not an
+importable package. It is in the package now, which is the point: the pinning and
+the run log are what makes a finding re-checkable, and that is production code.
+The tests below still take the module through the `common` fixture they were
+written against.
 """
 
-import importlib.util
 import random
-import sys
-from pathlib import Path
 
 import httpx
 import openai
@@ -23,24 +23,14 @@ import pytest
 
 from medical_rag.config import ModelConfig
 from medical_rag.data.load_medqa import MedQAQuestion
+from medical_rag.eval import runlog
 from medical_rag.generation.llm import GenerationResult, LLMError
-
-_MODULE_NAME = "exploration_common"
-_PATH = Path(__file__).resolve().parents[1] / "scripts" / "exploration" / "_common.py"
 
 
 @pytest.fixture(scope="module")
 def common():
-    """Load `_common.py` once per module, by file path."""
-    if _MODULE_NAME in sys.modules:
-        return sys.modules[_MODULE_NAME]
-    spec = importlib.util.spec_from_file_location(_MODULE_NAME, _PATH)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    # Register before exec: the module's own imports resolve against sys.modules.
-    sys.modules[_MODULE_NAME] = module
-    spec.loader.exec_module(module)
-    return module
+    """The module under test, handed to the tests that were written around it."""
+    return runlog
 
 
 def _question(index: int, answer_idx: str = "A", letters: str = "ABCD") -> MedQAQuestion:

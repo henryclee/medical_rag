@@ -13,15 +13,15 @@ for (`supports_options`) -- and gold-option recall is computed
 leaks the answer into the grading prompt.
 
 The grid is five strategies -- dense, dense+rerank (today's production config),
-BM25 (see `bm25_index.py`), hybrid RRF fusion of dense+BM25, and hybrid+rerank
-(`hybrid.py`) -- crossed with two query variants: the question text (`__orig`)
+BM25 (see `retrieval/lexical.py`), hybrid RRF fusion of dense+BM25, and hybrid+rerank
+(`retrieval/fusion.py`) -- crossed with two query variants: the question text (`__orig`)
 and a reformulated information need (`__reform`), rewritten with
-`build_reformulation_prompt()`. Ten cells, defined once in `strategies.py`, which
-`inspect_retrieval.py` renders cell by cell.
+`build_reformulation_prompt()`. Ten cells, defined once in `retrieval/strategy.py`, which
+`eval/inspector.py` renders cell by cell.
 
 For each pinned question, every cell's candidate chunk_ids are unioned and judged
 once per unseen chunk -- so ten methods cost no more judge time than one.
-Verdicts live in a persistent cache (`judge_cache.py`) keyed
+Verdicts live in a persistent cache (`eval/judge.py`) keyed
 `(question_id, chunk_id, judge_prompt_sha)`, so a rerun pays only for chunks no
 run has graded before, and the chunk *text* the run surfaced is written to a
 `chunks.jsonl` sidecar so the run can be re-read without loading the index.
@@ -29,26 +29,28 @@ run has graded before, and the chunk *text* the run surfaced is written to a
 The first run of this script (2026-09-29) reported a `reform_dense` method whose
 reformulation fell back to the raw question on 18 of 20 questions; `FINDINGS.md`
 quotes numbers from it that the run never measured. The parsing bug behind that
-is fixed in `reformulate.py`, and `render_findings` now prints an integrity
+is fixed in `eval/rewrite.py`, and `render_findings` now prints an integrity
 section that states how many rows fell back before any Δ can be read.
 
-Side track, not a numbered phase (PLAN.md "Next actions"): production code
-under `src/medical_rag/` is not touched. Follows `scripts/exploration/`'s
-conventions (`RunWriter`, `error_row`, `EndpointCircuitBreaker`,
-`--dry-run`/`--resume`/`--note`) via `_common.py`, and reuses `raw_rag.py`'s
-`preflight()`/`build_retriever()`/`resolve_index_dir()` rather than
-reimplementing them.
+This is the measurement the retrieval track (R-phases in `PLAN.md`) iterates
+against, which is why it lives in the package rather than in an experiment
+directory: `eval/` is production code now. It follows `scripts/exploration/`'s
+run conventions (`RunWriter`, `error_row`, `EndpointCircuitBreaker`,
+`--dry-run`/`--resume`/`--note`) via `eval/runlog.py` and builds its retriever
+through `retrieval.strategy.build_retriever`, the same entry point the frozen
+Phase 5-6 scripts use.
 
     set -a; source .env; set +a
-    .venv/bin/python experiments/retrieval_tuning/judge_harness.py --dry-run
-    .venv/bin/python experiments/retrieval_tuning/judge_harness.py --limit 2   # live smoke
-    .venv/bin/python experiments/retrieval_tuning/judge_harness.py             # full 20
+    .venv/bin/python scripts/run_retrieval_grid.py --dry-run
+    .venv/bin/python scripts/run_retrieval_grid.py --limit 2   # live smoke
+    .venv/bin/python scripts/run_retrieval_grid.py             # full sample
+    .venv/bin/python scripts/run_retrieval_grid.py --rerender \
+        outputs/exploration/retrieval_tuning/20260929T120215Z   # rebuild report, 0 calls
 """
 
 import argparse
 import asyncio
 import json
-import sys
 from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,13 +60,14 @@ from loguru import logger
 
 from medical_rag.config import ExperimentConfig, load_config
 from medical_rag.data.load_medqa import MedQAQuestion, load_medqa
-from medical_rag.generation.llm import LLMClient, LLMError
-
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(_REPO_ROOT / "scripts" / "exploration"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from _common import (  # noqa: E402
+from medical_rag.eval.judge import DEFAULT_JUDGE_CACHE, ensure_verdicts, load_cache
+from medical_rag.eval.metrics import aggregate
+from medical_rag.eval.rewrite import load_template, reformulate_query
+# Only the sha: the harness stamps it on every verdict but never words a grading
+# prompt itself -- `eval.judge.ensure_verdicts` builds that from `eval.rubric`, so
+# there is one wording and the cache key cannot drift from it.
+from medical_rag.eval.rubric import judge_prompt_sha
+from medical_rag.eval.runlog import (
     DEFAULT_RUN_ROOT,
     DEFAULT_SAMPLE_SEED,
     EndpointCircuitBreaker,
@@ -74,26 +77,18 @@ from _common import (  # noqa: E402
     select_by_ids,
     warn_on_degenerate_sample,
 )
-from raw_rag import Preflight, build_retriever, preflight, resolve_index_dir  # noqa: E402
-from bm25_index import DEFAULT_BM25_PATH, load_or_build_bm25_index  # noqa: E402
-from chunk_store import append_chunks  # noqa: E402
-from judge_cache import DEFAULT_JUDGE_CACHE, ensure_verdicts, load_cache  # noqa: E402
-from judge_prompt import (  # noqa: E402
-    JUDGE_JSON_INSTRUCTION,
-    JUDGE_SYSTEM_PROMPT,
-    ChunkJudgment,  # noqa: F401 - re-exported: older tooling imports the schema here
-    JudgeVerdict,  # noqa: F401 - ditto
-    build_judge_prompt,  # noqa: F401 - ditto
-    judge_prompt_sha,
-)
-from metrics import aggregate  # noqa: E402
-from reformulate import load_template, reformulate_query  # noqa: E402
-from strategies import (  # noqa: E402
+from medical_rag.eval.store import append_chunks
+from medical_rag.generation.llm import LLMClient, LLMError
+from medical_rag.generation.preflight import Preflight, preflight
+from medical_rag.retrieval.lexical import DEFAULT_BM25_PATH, load_or_build_bm25_index
+from medical_rag.retrieval.strategy import (
     BASE_STRATEGIES,
     METHOD_GRID,
     QUERY_VARIANTS,
     aretrieve_grid,
+    build_retriever,
     canonical_method,
+    resolve_index_dir,
 )
 
 PHASE = "retrieval_tuning"
@@ -110,17 +105,11 @@ SAMPLE_QUESTION_IDS: list[str] = [
 
 K_VALUES = (5, 10, 20)  # reported k values; `metrics.K_VALUES` holds the same tuple
 
-# The grid, from `strategies.py`: five strategies x two query variants. This
+# The grid, from `retrieval.strategy`: five strategies x two query variants. This
 # module used to carry its own six-name list with `reform_dense` as a sixth
 # strategy, which is what let a broken reformulation hide as a method -- the ids
-# now come from the one module `inspect_retrieval.py` also uses.
+# now come from the one module `eval.inspector` also uses.
 METHOD_NAMES = METHOD_GRID
-
-# The rubric lives in `judge_prompt.py` so the inspector grades with identical
-# wording (and the verdict cache keys on one `judge_prompt_sha()`); these two
-# aliases exist because older tooling imports the underscore names from here.
-_JUDGE_SYSTEM_PROMPT = JUDGE_SYSTEM_PROMPT
-_JUDGE_JSON_INSTRUCTION = JUDGE_JSON_INSTRUCTION
 
 
 def parse_args() -> argparse.Namespace:

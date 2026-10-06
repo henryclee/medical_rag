@@ -1,9 +1,13 @@
 # ADR-0006: Final token ceilings and sampling parameters
 
 ## Status
-Accepted. Resolves the contradiction between `PLAN.md`'s Phase 5 status line
-(both arms settled, `model_b` 16,384 → 8,096) and its open-questions item 8
-(`model_b`'s 16,384 "not validated"), which had been carried side by side.
+Accepted. Scoped by [ADR-0007](./0007-retrieval-first-direction-change.md) to the
+frozen Phases 5-6 tooling -- the retrieval track's mainline pays only
+`judge_model`, whose own server-side settings are now load-bearing
+([ADR-0008](./0008-judge-cache-as-ground-truth.md)). Resolves the contradiction
+between `PLAN.md`'s Phase 5 status line (both arms settled, `model_b`
+16,384 → 8,096) and its open-questions item 8 (`model_b`'s 16,384 "not
+validated"), which had been carried side by side.
 
 ## Context
 Phase 5 asked whether each model's `max_new_tokens` was right. Run 1 gave a

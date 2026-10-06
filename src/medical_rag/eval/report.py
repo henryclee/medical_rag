@@ -32,10 +32,10 @@ from medical_rag.data.load_medqa import MedQAQuestion
 from medical_rag.retrieval.retriever import RetrievedChunk
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids a runtime cycle
-    from ceiling import CeilingResult
+    from medical_rag.retrieval.ceiling import CeilingResult
 
-from metrics import K_VALUES, cell_metrics
-from strategies import (
+from medical_rag.eval.metrics import K_VALUES, cell_metrics
+from medical_rag.retrieval.strategy import (
     BASE_STRATEGIES,
     METHOD_GRID,
     QUERY_VARIANTS,
@@ -273,7 +273,7 @@ def view_from_row(
     a measured reform result. Missing question text (the first run's rows store
     only `question_id`) degrades to ids + verdicts with a visible warning rather
     than a crash -- but then again that run's rows never had options either, so
-    the dataset load in `inspect_retrieval.py` is what makes this readable.
+    the dataset load in `eval/inspector.py` is what makes this readable.
     """
     gold = str(row.get("correct_answer", "")).upper()
     judgments = row.get("judgments") or {}
@@ -1010,7 +1010,7 @@ def render_main(
     position and every hand-opened ``<details>``. Both the static report and the
     live page render their body from here, so the browser can never show a layout
     the tracked report does not have -- two renderers is how a viewer drifts from
-    the table it exists to explain (see ``strategies.py``'s docstring).
+    the table it exists to explain (see ``retrieval/strategy.py``'s docstring).
     """
     meta = dict(meta or {})
     fallbacks = [

@@ -5,7 +5,7 @@ and the aggregate table shows a different number for the same method, neither
 is believable. `judge_harness.compute_metrics()` delegates here.
 
 Every formula takes the gold letter *as data* -- the caller reads it off the
-dataset, the judge never sees it (`judge_prompt.py`).
+dataset, the judge never sees it (`eval/rubric.py`).
 """
 
 from __future__ import annotations

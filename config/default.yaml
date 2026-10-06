@@ -1,4 +1,7 @@
 benchmark: medqa_usmle
+# Every measurement run reads dev_split -- it is what the pinned samples, the
+# judge cache and FINDINGS.md are all built from. test_split exists so a future
+# confirmatory run has a held-out split to use; nothing here reads it today.
 dev_split: train
 test_split: test
 output_dir: outputs
@@ -6,14 +9,14 @@ output_dir: outputs
 retrieval:
   corpus: statpearls
   embedding_model: BAAI/bge-small-en-v1.5
-  chunk_size: 512
-  chunk_overlap: 64
+  # The shipped strategy: one of the five the grid measures (dense,
+  # dense_rerank, bm25, hybrid, hybrid_rerank). `dense_rerank` records today's
+  # behaviour, not a verdict -- the lexical fix (R4) and the funnel tuning (R5)
+  # decide whether it stays, and this line is where that decision lands.
+  strategy: dense_rerank
   top_k_retrieve: 20
   top_k_rerank: 5
   reranker_model: cross-encoder/ms-marco-MiniLM-L-6-v2
-
-verifier:
-  min_chunks: 2
-
-reformulator:
-  max_retries: 2
+  bm25_top_k: 20
+  # RRF smoothing constant, as measured. Not a knob to fiddle with between runs.
+  rrf_k: 60

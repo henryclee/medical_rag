@@ -22,16 +22,23 @@ plausible result computed from the wrong input -- rather than arithmetic:
   so `aggregate_views` counts questions rather than clicks, and answers a bad knob
   with a 400 rather than a 200 holding a traceback (`serve`, `render`)
 
-The experiment modules import each other by bare name (`from strategies import
-...`), the way `scripts/exploration/` does, so the directory goes on `sys.path`
-rather than each module being loaded by path with `importlib` -- they are not
-packages, and they are not meant to be importable from `src/`.
+The modules under test moved into the package (R1 of `refactor_plan.md`); these
+long-standing test files keep their original short names for them through the
+aliases below, because the assertions are about behaviour and renaming 1300 lines
+of references would only bury the diff. The mapping, if you are chasing a name:
+
+    strategies    -> medical_rag.retrieval.strategy
+    render        -> medical_rag.eval.report
+    chunk_store   -> medical_rag.eval.store
+    judge_cache   -> medical_rag.eval.judge
+    judge_prompt  -> medical_rag.eval.rubric
+    reformulate   -> medical_rag.eval.rewrite
+    serve         -> medical_rag.eval.lab
 """
 
 import asyncio
 import json
 import re
-import sys
 import threading
 import time
 import types
@@ -39,22 +46,17 @@ from pathlib import Path
 
 import pytest
 
-_REPO = Path(__file__).resolve().parents[1]
-_EXP = _REPO / "experiments" / "retrieval_tuning"
-if str(_EXP) not in sys.path:
-    sys.path.insert(0, str(_EXP))
-
-import ceiling  # noqa: E402
-import chunk_store  # noqa: E402
-import judge_cache  # noqa: E402
-import judge_prompt  # noqa: E402
-import metrics  # noqa: E402
-import reformulate  # noqa: E402
-import render  # noqa: E402
-import serve  # noqa: E402
-import strategies  # noqa: E402
-from medical_rag.data.load_medqa import MedQAQuestion  # noqa: E402
-from medical_rag.retrieval.retriever import RetrievedChunk  # noqa: E402
+from medical_rag.data.load_medqa import MedQAQuestion
+from medical_rag.retrieval import ceiling
+from medical_rag.retrieval import strategy as strategies
+from medical_rag.retrieval.retriever import RetrievedChunk
+from medical_rag.eval import judge as judge_cache
+from medical_rag.eval import metrics
+from medical_rag.eval import report as render
+from medical_rag.eval import rewrite as reformulate
+from medical_rag.eval import rubric as judge_prompt
+from medical_rag.eval import store as chunk_store
+from medical_rag.eval import lab as serve
 
 
 def chunk(chunk_id: str, *, body: str | None = None, score: float = 1.0) -> RetrievedChunk:
@@ -310,14 +312,21 @@ def test_manual_result_never_claims_a_prompt_ran():
 # --- judge cache ---------------------------------------------------------------
 
 
-def test_judge_rubric_matches_the_harness_so_cached_verdicts_stay_valid():
-    # The 2026-09-29 run paid ~820 verdicts with the harness's wording. If that
-    # wording had moved into `judge_prompt.py` reworded, every cached verdict would
-    # silently belong to a rubric nobody chose.
-    import judge_harness
+def test_the_harness_keeps_no_private_copy_of_the_rubric():
+    # The ~820 paid verdicts were worded by the harness, and this guard existed so
+    # that a reworded second copy elsewhere could not silently orphan them. The R1
+    # move removed the harness's copy outright -- it stamps the sha and never words
+    # a prompt -- so the guard is now structural: exactly one wording, and the two
+    # modules that touch it resolve it out of `eval.rubric`.
+    from medical_rag.eval import harness, judge
 
-    assert judge_harness._JUDGE_SYSTEM_PROMPT == judge_prompt.JUDGE_SYSTEM_PROMPT
-    assert judge_harness._JUDGE_JSON_INSTRUCTION == judge_prompt.JUDGE_JSON_INSTRUCTION
+    assert not [n for n in vars(harness) if n.startswith("_JUDGE")], (
+        "a second copy of the rubric in the harness would let the wording it "
+        "grades with drift from the sha it stamps"
+    )
+    assert judge.JUDGE_SYSTEM_PROMPT is judge_prompt.JUDGE_SYSTEM_PROMPT
+    assert judge.build_judge_prompt is judge_prompt.build_judge_prompt
+    assert harness.judge_prompt_sha is judge_prompt.judge_prompt_sha
     built = judge_prompt.build_judge_prompt(question(), [chunk("c1")])
     assert "c1" in built and "NOT told which option is correct" in built
     assert built.count("beta") == 1, "the gold option appears once, as an option -- never as the answer"
@@ -376,7 +385,7 @@ class FakeJudge:
         self.prompts: list[str] = []
 
     async def agenerate_structured(self, prompt, output_type, *, system_prompt=None, **kwargs):
-        from judge_prompt import ChunkJudgment
+        from medical_rag.eval.rubric import ChunkJudgment
 
         self.prompts.append(prompt)
         return judge_prompt.JudgeVerdict(
@@ -581,7 +590,7 @@ def test_inspection_rows_round_trip_through_the_harness_shape(tmp_path):
     # `inspect_retrieval` writes `results.jsonl` in the harness's shape so
     # `judge_cache --import-run` and grep keep working on an inspection dir; that
     # only holds if question/options survive the trip, which the first run lacked.
-    import inspect_retrieval
+    from medical_rag.eval import inspector as inspect_retrieval
 
     grid = _sample_grid()
     judgments = {
@@ -748,7 +757,7 @@ def _rerender_args(run: Path, findings: Path):
 
 
 def test_canonicalize_rows_maps_legacy_ids_and_keeps_the_original_row(tmp_path: Path) -> None:
-    import judge_harness
+    from medical_rag.eval import harness as judge_harness
 
     row = _legacy_row(1)
     row["candidates"]["paraphrase_rerank"] = ["zz"]  # unrecognised: dropped, never guessed
@@ -771,7 +780,7 @@ def test_canonicalize_rows_maps_legacy_ids_and_keeps_the_original_row(tmp_path: 
 
 
 def test_legacy_rows_produce_metrics_rather_than_empty_ones() -> None:
-    import judge_harness
+    from medical_rag.eval import harness as judge_harness
 
     summary = judge_harness.compute_metrics([_legacy_row(1), _legacy_row(2)])
     assert summary["methods"]["dense__orig"]["n"] == 2
@@ -784,7 +793,7 @@ def test_legacy_rows_produce_metrics_rather_than_empty_ones() -> None:
 def test_rerender_reads_a_run_offline_and_labels_the_legacy_ids(tmp_path: Path) -> None:
     import asyncio
 
-    import judge_harness
+    from medical_rag.eval import harness as judge_harness
 
     run = tmp_path / "run"
     run.mkdir()
@@ -807,7 +816,7 @@ def test_rerender_reads_a_run_offline_and_labels_the_legacy_ids(tmp_path: Path) 
 def test_rerender_stops_on_a_run_it_cannot_read(tmp_path: Path) -> None:
     import asyncio
 
-    import judge_harness
+    from medical_rag.eval import harness as judge_harness
 
     empty = tmp_path / "empty"
     empty.mkdir()

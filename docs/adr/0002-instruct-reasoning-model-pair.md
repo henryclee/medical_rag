@@ -1,7 +1,10 @@
 # ADR-0002: Instruct / reasoning model pair
 
 ## Status
-Accepted (Phase 4).
+Accepted (Phase 4). Partially superseded by
+[ADR-0007](./0007-retrieval-first-direction-change.md): the pair, its per-arm
+settings and Phases 5-6's per-arm evidence all stand, but the model factor no
+longer has a study to feed -- the factorial that needed it was cut.
 
 ## Context
 The design's `model` factor was a placeholder. If the two arms turned out to be

@@ -1,10 +1,15 @@
 """Configuration loading for the medical RAG experiment.
 
-Loads and merges YAML configuration from config/default.yaml,
-config/models.yaml, and config/conditions.yaml into typed, validated
-pydantic models consumed by the rest of the pipeline. Every model is served
-remotely behind an OpenAI-compatible endpoint -- there is no local model
-loading or quantization config here.
+Loads and merges YAML configuration from config/default.yaml and
+config/models.yaml into typed, validated pydantic models consumed by the rest
+of the pipeline. Every model is served remotely behind an OpenAI-compatible
+endpoint -- there is no local model loading or quantization config here.
+
+The condition set this used to carry -- `conditions.yaml`, its
+model x reformulation x verification factorial, and the `verifier` /
+`reformulator` blocks -- is gone. The study it described was cut when retrieval
+became the mainline, and config keys no code reads are worse than absent ones:
+they read as parameters that were chosen.
 
 `load_config()` also fills `os.environ` from the repo's gitignored `.env`
 (see `load_env()`), because `LLMClient` reads every endpoint key with
@@ -19,7 +24,6 @@ was fine.
 
 import os
 from pathlib import Path
-from typing import Any
 
 import yaml
 from dotenv import dotenv_values, find_dotenv
@@ -56,55 +60,53 @@ class ModelConfig(BaseModel):
 
 
 class RetrievalConfig(BaseModel):
+    """What to retrieve, from where, and how much of it survives the funnel.
+
+    Every field here is read, by `retrieval.strategy.RetrievalStrategy.from_config`.
+    The two chunking keys this class used to carry (`chunk_size: 512`,
+    `chunk_overlap: 64`) were read by nothing -- StatPearls is chunked by the
+    vendored MedRAG section algorithm, never by a token window -- so they are
+    deleted rather than wired up, and a future chunking lever adds a knob that
+    actually moves something.
+    """
+
     corpus: str
     embedding_model: str
-    chunk_size: int
-    chunk_overlap: int
+    # One of the five names the grid measured (`strategy.BASE_STRATEGIES`), so a
+    # row of FINDINGS.md and a production call cannot drift into meaning two
+    # different things. Validated at load, below.
+    strategy: str = "dense_rerank"
     top_k_retrieve: int
     top_k_rerank: int
     reranker_model: str
-
-
-class VerifierConfig(BaseModel):
-    min_chunks: int
-
-
-class ReformulatorConfig(BaseModel):
-    max_retries: int
-
-
-class ConditionConfig(BaseModel):
-    id: str
-    name: str
-    model: str
-    retrieval: bool
-    reformulation: bool
-    verification: bool
-    # Free-form lever parameters discovered useful during exploration (e.g.
-    # {"reranking": true}), so a new exploratory lever never needs its own
-    # typed field.
-    params: dict[str, Any] = {}
+    bm25_top_k: int = 20
+    # RRF smoothing constant: 60 is the value every measured `hybrid` number in
+    # this repo used. Tuning it is a lever (R5), not a default to fiddle with.
+    rrf_k: int = 60
 
 
 class ExperimentConfig(BaseModel):
     models: dict[str, ModelConfig]
     retrieval: RetrievalConfig
-    verifier: VerifierConfig
-    reformulator: ReformulatorConfig
-    conditions: list[ConditionConfig]
     benchmark: str
-    dev_split: str  # split Phases 5-9 run exploration against, not the test split
-    test_split: str  # split Phase 13's confirmatory run uses
+    dev_split: str  # every measurement run uses this split, never the test split
+    test_split: str
     output_dir: str
 
     @model_validator(mode="after")
-    def check_condition_models_exist(self) -> "ExperimentConfig":
-        for condition in self.conditions:
-            if condition.model not in self.models:
-                raise ValueError(
-                    f"condition '{condition.id}' references undefined model "
-                    f"'{condition.model}'; defined models: {sorted(self.models)}"
-                )
+    def check_retrieval_config_is_measurable(self) -> "ExperimentConfig":
+        """Reject an unmeasurable retrieval config at load, before anything is paid for.
+
+        Reuses `RetrievalStrategy`'s own checks rather than restating them: the
+        name must be one the grid measures, the funnel may not exceed the
+        candidate list it reorders, `top_k` must be positive. A `default.yaml`
+        that names `rrf_rerank`, or reranks 10 chunks out of a 5-chunk funnel,
+        is a typo -- and after an afternoon of judge calls is the expensive
+        place to discover a typo.
+        """
+        from medical_rag.retrieval.strategy import RetrievalStrategy  # local: strategy imports config
+
+        RetrievalStrategy.from_config(self)
         return self
 
 
@@ -113,8 +115,7 @@ def _env_file_candidates(config_dir: Path) -> list[Path]:
 
     Two roots are searched because the repo's commands are documented from the
     repo root (`README.md`, `file_layout.md`) but every script takes a
-    `--config` path and the exploration harnesses get run from their own
-    directory (`experiments/retrieval_tuning/judge_harness.py`):
+    `--config` path can be run from anywhere:
 
     1. the current directory and each ancestor of it -- so a harness launched
        from `experiments/retrieval_tuning/` still reaches the repo root's file;
@@ -172,7 +173,7 @@ def load_env(
       environment -- usually to nothing.
 
     Only variable *names* are ever logged; values never are, matching
-    `_common.py`'s context.md rule that `api_key_env` is recorded as a name.
+    `eval/runlog.py`'s context.md rule that `api_key_env` is recorded as a name.
     """
     paths = [Path(env_path)] if env_path is not None else _env_file_candidates(
         Path(config_path).resolve().parent
@@ -211,11 +212,11 @@ def load_config(
     env_path: str | Path | None = None,
     load_env_file: bool = True,
 ) -> ExperimentConfig:
-    """Load and merge default.yaml, models.yaml, and conditions.yaml.
+    """Load and merge default.yaml and models.yaml.
 
-    `path` points at default.yaml; models.yaml and conditions.yaml are read
-    from the same directory. Raises on any missing file, invalid YAML, or
-    a condition that references an undefined model.
+    `path` points at default.yaml; models.yaml is read from the same directory.
+    Raises on any missing file, invalid YAML, or a retrieval config that cannot
+    be measured (see `ExperimentConfig`'s validator).
 
     Loads `.env` into `os.environ` first (`load_env()`), so an `api_key_env`
     whose value lives in that file is populated before any `LLMClient` reads
@@ -229,7 +230,7 @@ def load_config(
         load_env(default_path, env_path=env_path)
 
     merged: dict = {}
-    for filename in ("default.yaml", "models.yaml", "conditions.yaml"):
+    for filename in ("default.yaml", "models.yaml"):
         file_path = config_dir / filename
         with file_path.open() as f:
             data = yaml.safe_load(f)

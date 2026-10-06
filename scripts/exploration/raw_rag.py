@@ -56,26 +56,18 @@ import json
 import time
 from collections import Counter, namedtuple
 from contextlib import AsyncExitStack
-from enum import Enum
 from pathlib import Path
 from typing import Any, Sequence, TextIO
 
 from loguru import logger
 
-from medical_rag.config import ExperimentConfig, ModelConfig, load_config
+from medical_rag.config import ExperimentConfig, load_config
 from medical_rag.data.load_medqa import MedQAQuestion, load_medqa
-from medical_rag.generation.llm import LLMClient, LLMError
-from medical_rag.generation.prompt import build_answer_prompt, format_context
-from medical_rag.retrieval.embedder import Embedder
-from medical_rag.retrieval.index import load_index
-from medical_rag.retrieval.retriever import RetrievedChunk, Retriever
-
-from _common import (
+from medical_rag.eval.runlog import (
     DEFAULT_RUN_ROOT,
     DEFAULT_SAMPLE_SEED,
     EndpointCircuitBreaker,
     RunWriter,
-    chunk_match_rank,
     error_row,
     missing_chunk_evidence,
     parse_notes,
@@ -86,6 +78,12 @@ from _common import (
     summarize_retrieval,
     warn_on_degenerate_sample,
 )
+from medical_rag.generation.llm import LLMClient, LLMError
+from medical_rag.generation.preflight import Preflight, preflight
+from medical_rag.generation.prompt import build_answer_prompt, format_context
+from medical_rag.retrieval.retriever import RetrievedChunk, Retriever
+from medical_rag.retrieval.strategy import build_retriever, resolve_index_dir
+from medical_rag.text import chunk_match_rank
 
 PHASE = "phase6"
 CONDITION_ID = "phase6_raw_rag"
@@ -408,100 +406,11 @@ def chain_header(row: dict[str, Any]) -> str:
     )
 
 
-class Preflight(Enum):
-    """Whether an arm may spend its completions on the endpoint it was given."""
-
-    PROCEED = "proceed"
-    BLOCK = "block"
-
-
-async def preflight(model: ModelConfig, client: LLMClient) -> tuple[Preflight, list[str]]:
-    """Confirm the endpoint answers and serves the model `models.yaml` names.
-
-    Returns a decision and the lines to print, rather than logging or raising: this
-    runs once per arm before ~20 completions each, and the two failure modes want
-    different handling. A dead endpoint blocks the whole run, but a misnamed
-    `api_model_name` only invalidates *that* arm -- dropping the arm and pairing
-    the other is a smaller loss than a run whose rows came from some other model.
-    Phase 5 §8.4 is the reason `BLOCK` refuses rather than warns: an endpoint
-    serving a different model produces rows that look identical and measure
-    something else.
-    """
-    try:
-        served = await client.client.models.list()
-    except Exception as exc:  # noqa: BLE001 - any failure here means "do not send"
-        return Preflight.BLOCK, [
-            f"{model.name}: endpoint {model.base_url} is not answering -- "
-            f"{type(exc).__name__}: {str(exc)[:150]}. Start the server that serves this model "
-            "(environment.md) or repoint config/models.yaml."
-        ]
-
-    ids = sorted({item.id for item in served.data if item.id})
-    if model.api_model_name not in ids:
-        return Preflight.BLOCK, [
-            f"{model.name}: {model.base_url} serves {ids} but models.yaml names "
-            f"'{model.api_model_name}' -- every completion would be rejected or, worse, "
-            "answered by a different model than this arm claims"
-        ]
-    return Preflight.PROCEED, [
-        f"{model.name}: {model.base_url} serves {model.api_model_name} (offering {', '.join(ids)})"
-    ]
-
-
-# --- retrieval --------------------------------------------------------------
-
-
-def resolve_index_dir(
-    config: ExperimentConfig, index_dir: str | Path | None = None
-) -> Path:
-    """Where the LanceDB table lives, given `--index-dir` or the config's corpus.
-
-    `RetrievalConfig` names a `corpus`, not a directory, so the mapping is here
-    rather than in the config -- but it is one function used by both the plan print
-    and the loader so the number in `context.md` cannot disagree with the table
-    actually queried.
-    """
-    if index_dir:
-        return Path(index_dir)
-    return Path("data/index") / config.retrieval.corpus
-
-
-def build_retriever(
-    config: ExperimentConfig, index_dir: str | Path | None = None
-) -> tuple[Retriever, dict[str, Any]]:
-    """Load the Phase 2 index and wire the Phase 3 retriever onto it.
-
-    Returns the retriever and the *static* retrieval fields every row of this run
-    shares -- index path, row count, the two encoder names, the device. Taken once
-    here rather than re-read per question, because `Embedder` exposes no
-    `model_name` attribute and a row that silently recorded `None` for the
-    embedding model would look like a config change rather than a missing getter.
-
-    Nothing here rebuilds anything: `build_index.py` records a corpus hash, so a
-    silently rebuilt index would be a second, invisible variable under a run whose
-    whole claim is a delta against Phase 5.
-    """
-    path = resolve_index_dir(config, index_dir)
-    if not path.exists():
-        raise SystemExit(
-            f"no index at {path} -- run .venv/bin/python scripts/build_index.py first "
-            "(environment.md §5.1: the index is built once and reused by every phase)"
-        )
-    table = load_index(path)
-    retriever = Retriever(
-        Embedder(model_name=config.retrieval.embedding_model),
-        table,
-        config.retrieval.reranker_model,
-    )
-    static = {
-        "index_dir": str(path),
-        "index_rows": table.count_rows(),
-        "embedding_model": config.retrieval.embedding_model,
-        "reranker_model": config.retrieval.reranker_model,
-        "device": retriever.embedder.device,
-    }
-    return retriever, static
-
+# `Preflight` / `preflight` and `resolve_index_dir` / `build_retriever` moved
+# out of this script: they are endpoint hygiene and index wiring that the judge
+# harness also needs, and importing them from here made a Phase 6 answer run the
+# dependency root for retrieval measurement. They live in
+# `medical_rag.generation.preflight` and `medical_rag.retrieval.strategy` now.
 
 
 def retrieve_pass(

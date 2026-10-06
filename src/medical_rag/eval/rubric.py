@@ -1,6 +1,6 @@
 """The judge rubric: schema, prompt, and the hash the verdict cache is keyed on.
 
-Lives here rather than in `judge_harness.py` because `inspect_retrieval.py`
+Lives here rather than in `eval/harness.py` because `eval/inspector.py`
 issues the same call over the same chunks, and a viewer that re-grades with
 drifted wording produces verdicts that look interchangeable with the harness's
 but are not. Split out of the harness, wording unchanged, so the ~820 verdicts

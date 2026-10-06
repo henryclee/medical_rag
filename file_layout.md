@@ -1,78 +1,122 @@
 # File Layout
 
-Part of the plan (./PLAN.md). Update this file when the tree changes; plan.md shouldn't need to change for that.
+Part of the plan (./PLAN.md). Update this file when the tree changes; PLAN.md shouldn't need to change for that.
+
+The rule that prunes this tree: it keeps the code that measures retrieval and the
+code that is cited as evidence, and nothing that only aspired to be either. The
+generator-side scaffolding is deleted rather than stubbed -- `modules/`,
+`experiment/`, `analysis/`, `run_pilot.py`, `run_experiment.py`,
+`config/conditions.yaml`, `tests/test_reformulator.py`,
+`tests/test_verifier.py`. A stub directory is how a plan pretends it has an
+implementation, and this repo has already paid for one plausible table computed
+by a lever that never ran (`__reform`, 18/20 fallbacks).
 
 ```
-config/default.yaml            Benchmark name, output dir, and retrieval defaults (corpus, embedding/reranker model, chunk/top-k sizes).
-config/models.yaml             Per-model remote endpoint config (base_url, api_model_name, api_key_env, sampling params, timeout/max_retries, answer_recovery_max_tokens) for model_a/model_b — two genuinely different served models on two local mlx_lm.server endpoints (section 6, item 2).
-config/conditions.yaml         Experiment conditions for the current study; provisional until the Phase 10 design freeze, named and ID-ordered to match the delta formulas metrics.py will use.
+config/default.yaml            Benchmark, splits, output dir, and the `retrieval:` block that IS the experiment: corpus, embedding/reranker model, `strategy`, `top_k_retrieve`/`top_k_rerank`/`bm25_top_k`, `rrf_k`. Every field is read, by `RetrievalStrategy.from_config()`; the comments say which measurement picked the value. `chunk_size`/`chunk_overlap` are gone -- StatPearls is chunked by the vendored MedRAG section algorithm, never by a token window, so those keys moved nothing.
+config/models.yaml             Per-model endpoint config (base_url, api_model_name, api_key_env, sampling params, ceilings) against one oMLX server on :8080. The mainline reads `judge_model` only; `model_a`/`model_b` remain because the frozen Phase 5-6 scripts read them.
 pyproject.toml                 Package metadata, exact-pinned dependencies, pytest config.
 requirements.lock.txt          Full `pip freeze` snapshot of the environment.
-.gitignore                     Excludes .venv/, data/, outputs/, caches, and .env — and deliberately NOT experiments/, which is tracked because exploratory evidence has to be versioned to be reviewable (section 5's artifact convention).
-.env                           Gitignored. Holds MODEL_A_API_KEY / MODEL_B_API_KEY / JUDGE_MODEL_API_KEY for the served endpoints; `config.load_env()` merges it into `os.environ` during `load_config()` (an exported value always wins), so `source` is only needed for raw `curl` checks.
-.env.example                   Template listing those variable names with no secrets.
-README.md                      Overview/Installation/Usage (Usage still a stub).
-PLAN.md                        This file.
+.gitignore                     Excludes .venv/, data/, outputs/, caches, .env -- and `prompt.md`, which is worth knowing about: a root file by that name is invisible to `git status`, so deleting one looks like a no-op. Deliberately NOT excluded: experiments/, because exploratory evidence has to be versioned to be reviewable.
+.env / .env.example            `.env` is gitignored and holds the endpoint keys; `.env.example` is tracked and lists the variable names with no secrets. `load_config()` merges `.env` into `os.environ` (an exported value wins; an empty `KEY=` stays empty), so `source` is only needed for raw `curl` checks.
+README.md                      What the repo does now, and the one command that scores a retrieval hypothesis.
+PLAN.md                        The operating plan: R1-R6, the constraints that each cost a bad measurement, the backlog.
+refactor_plan.md               R1's own record -- what moved, what was deleted, and the judgement calls made without asking. Read it before asking "why is this here?".
+interfaces.md                  Public contracts: signatures, invariants, stability.
+environment.md                 Runtimes, versions, setup. Its endpoint section is stale (two `mlx_lm.server` instances on :8081/:8082); `config/models.yaml`'s header is authoritative -- one oMLX on :8080.
 
 src/medical_rag/__init__.py            Package version (__version__ = "0.1.0").
-src/medical_rag/config.py              Pydantic config models + load_config().
+src/medical_rag/paths.py               REPO_ROOT, written down once. Per-module `Path(__file__).parents[n]` arithmetic is exactly what silently pointed at the wrong directory when a module moved a level.
+src/medical_rag/config.py              Pydantic models + `load_config()`/`load_env()`. Merges two files (default.yaml, models.yaml). Its validator refuses a retrieval block that cannot be measured: an unknown `strategy` name, or a rerank depth wider than the candidate list it reorders.
+src/medical_rag/text.py                `normalize()` / `contains()` / `chunk_match_rank()` -- one definition of "the same text", which the ceiling probe, the audit script and the gold-wording counts all need to agree on or they report three different recall numbers.
 src/medical_rag/data/__init__.py       Data subpackage docstring.
 src/medical_rag/data/load_medqa.py     MedQA-USMLE loader + MedQAQuestion model.
 src/medical_rag/data/load_statpearls.py StatPearls loader (NCBI download + MedRAG-algorithm chunking) + StatPearlsChunk model.
-src/medical_rag/data/chunking.py       Generic token-based chunker for any future non-pre-chunked corpus (unused by StatPearls).
+src/medical_rag/data/chunking.py       Generic token-based chunker, unused today; kept as the natural home of the backlog's chunking lever.
 src/medical_rag/retrieval/__init__.py  Retrieval subpackage docstring.
 src/medical_rag/retrieval/embedder.py  Embedder: wraps SentenceTransformer, BGE asymmetric query/passage convention.
-src/medical_rag/retrieval/index.py     LanceDB table build/load helpers.
+src/medical_rag/retrieval/index.py     LanceDB table build/load helpers (exact search; no ANN at this corpus size).
 src/medical_rag/retrieval/retriever.py Retriever: vector search + optional cross-encoder reranking; RetrievedChunk model.
-src/medical_rag/modules/__init__.py    Pipeline-modules subpackage docstring.
-src/medical_rag/modules/reformulator.py  [STUB] Query reformulation module.
-src/medical_rag/modules/verifier.py      [STUB] Answer/context verification module.
+src/medical_rag/retrieval/strategy.py  The seam between measuring and shipping: BASE_STRATEGIES, METHOD_GRID, `retrieve_base()` (one fan-out -> all five ranked lists), `retrieve_grid()`/`aretrieve_grid()`, `RetrievalStrategy` (config -> the funnel both the grid and a production call run), `build_retriever()`, `resolve_index_dir()`.
+src/medical_rag/retrieval/lexical.py   BM25Index + `load_or_build_bm25_index()`, pickling to `data/index/statpearls_bm25.pkl`. That file is big enough that `eval_retrieval.py` scores all five strategies in one pass rather than re-loading it per hypothesis; rebuilding it is `--rebuild-bm25`, deliberately not automatic.
+src/medical_rag/retrieval/fusion.py    `rrf_fuse()`. Pure, and the only place RRF's smoothing default is named.
+src/medical_rag/retrieval/ceiling.py   The corpus-ceiling probe. It reads the gold option's own wording, so it is an upper bound and never a lever -- it must not appear in a strategy table.
 src/medical_rag/generation/__init__.py Generation subpackage docstring.
-src/medical_rag/generation/llm.py      LLMClient: OpenAI-compatible async client, LLMError, structured output. IMPLEMENTED.
-src/medical_rag/generation/prompt.py   Prompt templates (answer/reformulation/verification) + parse_answer(). IMPLEMENTED.
-src/medical_rag/experiment/__init__.py Experiment subpackage docstring.
-src/medical_rag/experiment/conditions.py [STUB] Condition -> pipeline assembly.
-src/medical_rag/experiment/runner.py     [STUB] Main experiment loop + per-question result logging.
-src/medical_rag/experiment/metrics.py    [STUB] Accuracy, deltas, significance testing.
-src/medical_rag/analysis/__init__.py   Analysis subpackage docstring.
-src/medical_rag/analysis/failure_taxonomy.py [STUB] Failure categorization for incorrect answers.
-src/medical_rag/analysis/report.py           [STUB] Summary tables + figures + markdown report.
+src/medical_rag/generation/llm.py      LLMClient: OpenAI-compatible async client, LLMError, structured output.
+src/medical_rag/generation/prompt.py   Prompt builders + parse_answer(). The answer/verification builders are frozen Phase 5-6 tooling; `build_reformulation_prompt()` is the one still reachable from `eval/rewrite.py`.
+src/medical_rag/generation/preflight.py `Preflight`/`preflight()`: endpoint reachability and "does the advertised model id exist", shared by the grid and the frozen scripts.
 
-scripts/build_index.py         CLI: build the LanceDB retrieval index from a corpus. IMPLEMENTED.
-scripts/probe_models.py        CLI: repeatable live check of the served models — per-model cost/latency/throughput, `finish_reason`, the one-shot ANSWER-recovery path, and a saved copy of every chain of thought. Exits non-zero on endpoint or recovery failure. IMPLEMENTED.
-scripts/exploration/closed_book.py   Closed-book probe over a pinned dev-split sample, saving every chain of thought. [Phase 5, planned]
-scripts/exploration/raw_rag.py       Same, with retrieval + reranking wired in. [Phase 6, planned]
-scripts/exploration/_common.py       Shared row/chain writer for the two above; promoted into experiment/runner.py at Phase 9 if it earns it. [Phase 5, planned]
-scripts/run_pilot.py           [STUB] CLI: small-scale validation run.
-scripts/run_experiment.py      [STUB] CLI: full experiment run.
+src/medical_rag/eval/__init__.py       The offline measurement surface: everything that answers "did retrieval help?" without asking an answer model anything.
+src/medical_rag/eval/metrics.py        recall@k, relevant_fraction@k, first-relevant-rank, `aggregate()`. Pure.
+src/medical_rag/eval/rubric.py         The judging prompt and `judge_prompt_sha()`. Editing it invalidates every cached verdict on purpose: a verdict is a fact about a chunk under one rubric.
+src/medical_rag/eval/judge.py          The verdict cache and the only code that spends endpoint time; `python -m medical_rag.eval.judge --stats` reports how much of it is usable under the current rubric.
+src/medical_rag/eval/store.py          The `chunks.jsonl` sidecar -- stores the text a run retrieved so re-reading a run does not need the 380k-row index.
+src/medical_rag/eval/report.py         One grid renderer behind three outputs: terminal text, `report.html`, and the markdown of `FINDINGS.md`.
+src/medical_rag/eval/runlog.py         Pinned samples (`select_sample`/`select_by_ids`), the row schema (`result_row`/`error_row`), the run-dir writer, the endpoint circuit breaker. Formerly `scripts/exploration/_common.py`.
+src/medical_rag/eval/harness.py        The grid runner: retrieve -> judge the union of candidates -> metrics -> FINDINGS.md. `--rerender` rebuilds a report from a stored run offline.
+src/medical_rag/eval/inspector.py      Read a run back (`--from-run`, zero calls, zero models) or inspect live retrieval (`--question-id`, `--repl`).
+src/medical_rag/eval/lab.py            The localhost knob panel: serves `Inspector` so the index and embedder load once per session instead of once per guess.
+src/medical_rag/eval/rewrite.py        Query reformulation. Importable and unscheduled -- it is the one lever that still costs completions.
 
-tests/__init__.py
-tests/test_pipeline.py         Smoke test: package imports and has __version__.
-tests/test_config.py           load_config() success + undefined-model-reference rejection.
-tests/test_data_loading.py     MedQA loader schema/count (live) + StatPearls chunker logic (fixture, no network).
-tests/test_retrieval.py        Embedder shape, index build/save/load round-trip, retrieve() relevance, rerank() reordering.
-tests/test_retrieval_tuning.py The side-track offline: grid shape, candidate assembly, metrics, cache keying/eviction, chunk sidecar, and that legacy runs re-render without inventing comparisons.
-tests/test_generation.py       Prompt builders, parse_answer tiers, LLMClient over httpx.MockTransport, + one `live` endpoint test.
-tests/test_reformulator.py     [STUB] Placeholder for reformulator tests.
-tests/test_verifier.py         [STUB] Placeholder for verifier tests.
+scripts/eval_retrieval.py        THE command: score a strategy against the verdict cache, zero endpoint calls, and prints cache coverage as loudly as recall.
+scripts/run_retrieval_grid.py    Thin wrapper over `eval.harness.main()` -- the grid, and `--rerender` for the offline rebuild.
+scripts/inspect_retrieval.py     Thin wrapper over `eval.inspector.main()`.
+scripts/build_index.py           CLI: build the LanceDB retrieval index from a corpus.
+scripts/probe_models.py          CLI: live check of the served models -- cost/latency/throughput, `finish_reason`, the ANSWER-recovery path. Frozen tooling.
+scripts/exploration/closed_book.py  Phase 5: closed-book probe over the pinned sample, saving every chain of thought. Frozen.
+scripts/exploration/raw_rag.py      Phase 6: the same with retrieval + reranking wired in. Frozen.
+scripts/exploration/audit_run.py    Re-derives a phase's numbers from its `results.jsonl` and PASS/FAILs them against that phase's FINDINGS.md. Frozen; `eval_retrieval.py` is its successor for the R-phases.
 
-data/                          Gitignored. Cached corpora (data/statpearls/) and the built index (data/index/statpearls/).
-experiments/                   Tracked (deliberately NOT gitignored). Per-phase FINDINGS.md plus the failure chains each phase chose to keep — Phase 10's evidence base. [Phase 5 onwards]
-experiments/README.md          The convention in one page: what is tracked, the rules, how to start a new FINDINGS file.
-experiments/TEMPLATE.md        Skeleton that experiments/phaseN/FINDINGS.md is copied from.
-experiments/retrieval_tuning/  Tracked. The Phase 6 retrieval side-track: plan, harness, and FINDINGS. Code lives here rather than in src/ because it is measurement scaffolding, not pipeline code.
-experiments/retrieval_tuning/TUNING.md               The plan: methods under comparison, metrics, what a run costs, and what the first run actually showed (read this before re-running anything).
-experiments/retrieval_tuning/FINDINGS.md             Written by judge_harness.py, never by hand; `--rerender <run>` rebuilds it from a run dir with zero endpoint calls.
-experiments/retrieval_tuning/judge_harness.py        The grid runner: retrieve → judge the union → metrics → FINDINGS. `--rerender` re-renders an existing run offline.
-experiments/retrieval_tuning/strategies.py           METHOD_GRID (5 strategies × {__orig, __reform}), LEGACY_METHOD_ALIASES, and the candidate-list builders.
-experiments/retrieval_tuning/judge_prompt.py         The rubric. Its sha256 is part of every cache key, so editing it invalidates every verdict.
-experiments/retrieval_tuning/judge_cache.py          The verdict cache (judge_cache/judged_chunks.jsonl): load / ensure_verdicts / stats.
-experiments/retrieval_tuning/chunk_store.py          chunks.jsonl sidecar — stores the chunk text a run retrieved, so re-reading a run does not need the 380k-row index.
-experiments/retrieval_tuning/render.py               One grid renderer, three outputs: terminal text, report.html, and view_from_row() for re-reading stored rows.
-experiments/retrieval_tuning/inspect_retrieval.py    The inspector: `--question-id` / `--sample` (live) or `--from-run` (offline), writes the artifact set.
-experiments/retrieval_tuning/{metrics,hybrid,bm25_index,reformulate}.py  Recall/precision math, fusion, the lexical index, and query reformulation.
-outputs/exploration/retrieval_tuning/ Gitignored. `<UTC-stamp>/` harness runs and `<out-name>/` inspector dirs (results.jsonl, chunks.jsonl, report.html, questions/, context.md), plus the shared judge_cache/.
-outputs/probes/                Gitignored. probe_models.py rows + chains; in use since Phase 4.
-outputs/exploration/           Gitignored. Raw run dirs from scripts/exploration/ (results.jsonl, chains/<stamp>/, context.md).
-outputs/runs/                  Gitignored. Pilot and confirmatory results (Phases 9/13) — the only outputs/ tree RESULTS.md may cite.
+tests/test_pipeline.py           Smoke: package imports and exposes __version__.
+tests/test_config.py             load_config(), the .env merge rules, and the unmeasurable-funnel rejections.
+tests/test_data_loading.py       MedQA loader schema/count (live) + StatPearls chunker logic (fixture, no network).
+tests/test_retrieval.py          Embedder shape, index build/save/load round-trip, retrieve() relevance, rerank() reordering.
+tests/test_retrieval_strategy.py That config -> strategy loses no depth, that one fan-out yields all five lists, and that `retrieve()` is the same path the grid scores.
+tests/test_retrieval_tuning.py   The measurement machinery: grid shape, candidate assembly, cache keying/eviction, chunk sidecar, and that a legacy run re-renders without inventing comparisons.
+tests/test_generation.py         Prompt builders, parse_answer tiers, LLMClient over httpx.MockTransport, + one `live` endpoint test.
+tests/test_exploration_common.py Tests `eval/runlog` -- the filename still says `_common.py` because that is the module it grew up testing.
+tests/test_raw_rag.py            The frozen Phase 6 comparison logic: outcome classification, baseline pairing, drift detection. Loaded by path; `scripts/` is not an importable package.
+
+data/                          Gitignored. Cached corpora (data/statpearls/), the built index (data/index/statpearls/), and the BM25 pickle (data/index/statpearls_bm25.pkl).
+experiments/                   Tracked (deliberately NOT gitignored). Distilled evidence -- see experiments/README.md.
+experiments/phase5/            Frozen: closed-book FINDINGS + the chains it cites.
+experiments/phase6/            Frozen: raw-RAG FINDINGS + the chains it cites.
+experiments/phase4/            Frozen: endpoint/prompt findings.
+experiments/retrieval_tuning/  Tracked, and now documentation only: TUNING.md (the method) and FINDINGS.md (written by `eval.harness`, never by hand). The code that produced them moved into `src/medical_rag/`; a run directory plus the cache reproduces every cell.
+experiments/retrieval/         Does not exist yet. R-phase output starts at R2: `R<n>/FINDINGS.md`, plus the tracked oracle snapshot under `evalset/`.
+experiments/TEMPLATE.md        Skeleton a new FINDINGS.md is copied from (written for the generation phases; its per-arm sections no longer apply).
+outputs/exploration/retrieval_tuning/ Gitignored. `<UTC-stamp>/` grid runs and `inspect_<stamp>/` inspector dirs, plus the oracle cache at `judge_cache/judged_chunks.jsonl`.
+outputs/exploration/phaseN/    Gitignored. Raw run dirs from `scripts/exploration/` (results.jsonl, chains/, context.md).
+outputs/probes/                Gitignored. probe_models.py rows + chains.
 ```
+
+## What moved in R1, and why it was not left where it was
+
+`scripts/exploration/_common.py` is gone, not shimmed. It was the shared spine of
+every measurement script and it lived behind a `sys.path.insert`, with
+`tests/test_exploration_common.py` loading it by file path to prove nothing
+better than "this import works by accident". A shim would only keep the pretence
+that `scripts/` owns code the package depends on. The harness, inspector,
+renderer, verdict cache, rubric, metrics, sidecar store, BM25 index, RRF fusion
+and ceiling probe moved into the package for the same reason: they are what this
+project produces, not scaffolding around something else.
+
+`experiments/retrieval_tuning/` keeps only prose. That is the honest inventory --
+the directory's code is reproducible from the package, and its numbers are
+reproducible from a run directory plus the cache.
+
+## Two conventions that hold it together
+
+**Nothing under `src/` imports from `scripts/`.** One direction only. When the
+grid lived in `experiments/retrieval_tuning/` and the shared helpers in
+`scripts/exploration/`, package code and script code needed each other, and the
+only way to make that work was `sys.path` surgery at import time -- which works
+until a module moves a level, and then fails somewhere far from the edit. If
+`src/` needs something, that thing is in `src/`.
+
+**`scripts/*.py` are thin.** Each is argument parsing plus a call to a package
+`main()`, and `python -m medical_rag.eval.harness` is the identical command. The
+wrapper exists so `ls scripts/` shows the study's commands without first
+learning the package layout; the logic never lives there, because a script is not
+importable and therefore not testable. `scripts/exploration/` is the exception
+that is honest about itself: those are frozen Phase 5-6 commands, loaded by path
+in tests when they are tested at all.

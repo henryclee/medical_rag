@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,21 +35,23 @@ from medical_rag.data.load_medqa import MedQAQuestion
 from medical_rag.generation.llm import LLMClient, LLMError
 from medical_rag.retrieval.retriever import RetrievedChunk
 
-_HERE = Path(__file__).resolve().parent
-_ROOT = _HERE.parent.parent
-for _path in (_HERE, _ROOT / "scripts" / "exploration"):
-    if str(_path) not in sys.path:
-        sys.path.insert(0, str(_path))
-
-from _common import EndpointCircuitBreaker  # noqa: E402
-from judge_prompt import (  # noqa: E402
+from medical_rag.eval.rubric import (
     JUDGE_SYSTEM_PROMPT,
     JudgeVerdict,
     build_judge_prompt,
     judge_prompt_sha,
 )
+from medical_rag.eval.runlog import EndpointCircuitBreaker
+from medical_rag.paths import REPO_ROOT
 
-DEFAULT_JUDGE_CACHE = _ROOT / "outputs" / "exploration" / "retrieval_tuning" / "judge_cache" / "judged_chunks.jsonl"
+DEFAULT_JUDGE_CACHE = (
+    REPO_ROOT
+    / "outputs"
+    / "exploration"
+    / "retrieval_tuning"
+    / "judge_cache"
+    / "judged_chunks.jsonl"
+)
 
 # 40 chunks/batch is what the 20-question run used and where the endpoint's
 # structured output started truncating mid-list on longer prompts; half that is
