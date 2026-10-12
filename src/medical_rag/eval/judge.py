@@ -36,8 +36,9 @@ from medical_rag.generation.llm import LLMClient, LLMError
 from medical_rag.retrieval.retriever import RetrievedChunk
 
 from medical_rag.eval.rubric import (
-    JUDGE_SYSTEM_PROMPT,
+    DEFAULT_RUBRIC,
     JudgeVerdict,
+    RubricSpec,
     build_judge_prompt,
     judge_prompt_sha,
 )
@@ -204,16 +205,24 @@ async def ensure_verdicts(
     cache_path: str | Path = DEFAULT_JUDGE_CACHE,
     breaker: EndpointCircuitBreaker | None = None,
     batch: int = DEFAULT_BATCH,
-    judge_sha: str | None = None,
+    rubric: RubricSpec = DEFAULT_RUBRIC,
     source_run: str | None = None,
 ) -> JudgeOutcome:
     """Verdicts for every chunk, from cache where possible; judge only the rest.
+
+    `rubric` defaults to the frozen production rubric; passing a variant (e.g.
+    `STABILITY_VARIANT_RUBRIC`) grades under that rubric's own sha, so its
+    verdicts live alongside the default rubric's in the same cache without ever
+    colliding or cross-serving: lookup, records and the system prompt all come
+    from the one object. The loose `judge_sha` string override is gone on
+    purpose -- a verdict must never be graded under a wording the string doesn't
+    pin down (D4/C5).
 
     Raises `LLMError` if a batch fails outright (the caller writes an error row),
     but verdicts already obtained are appended to the cache first -- a run that
     dies on question 12 should not have to re-pay the first 11.
     """
-    judge_sha = judge_prompt_sha() if judge_sha is None else judge_sha
+    judge_sha = rubric.sha()
     outcome = JudgeOutcome(verdicts={})
     todo: list[RetrievedChunk] = []
     for chunk in chunks:
@@ -229,7 +238,7 @@ async def ensure_verdicts(
         prompt = build_judge_prompt(question, group)
         try:
             verdict = await client.agenerate_structured(
-                prompt, JudgeVerdict, system_prompt=JUDGE_SYSTEM_PROMPT
+                prompt, JudgeVerdict, system_prompt=rubric.system_prompt
             )
         except LLMError as exc:
             if breaker is not None:
@@ -270,6 +279,214 @@ async def ensure_verdicts(
         )
     return outcome
 
+
+
+def audit_run(run_dir: str | Path, *, cache_path: str | Path | None = None) -> dict[str, Any]:
+    """ADR-0008's clause, executed: every judged run must show zero drops.
+
+    For each non-error row of `results.jsonl`, `set(row["judgments"])` must
+    equal the union of `row["candidates"]` over the methods that row actually
+    carries -- exactly the ADR's invariant, and stricter than the run-time
+    `missing_judgment` counter, which only saw the chunks a *single pass* fed
+    the judge. A shortfall that survived a whole run (a resume re-writing only
+    part of a row, an import from an older harness, a verdict dropped by a
+    torn per-question commit) is invisible everywhere else: the affected slots
+    read as "no verdict", which reads as "not supporting" in every score.
+
+    Returns a summary dict; `problems` names every `(question_id, chunk_id)`
+    shortfall so a re-ask can target one batch instead of re-running.
+    """
+    path = Path(run_dir) / "results.jsonl"
+    if not path.exists():
+        raise SystemExit(f"{path} does not exist -- nothing to audit")
+
+    live_cache: dict[tuple[str, str], dict[str, Any]] = {}
+    if cache_path is not None:
+        live_cache, _ = load_cache(cache_path)
+
+    summary: dict[str, Any] = {
+        "run_dir": str(run_dir),
+        "rows": 0,
+        "error_rows": 0,
+        "clean_rows": 0,
+        "judgment_slots": 0,
+        "missing_judgments": 0,
+        "surplus_judgments": 0,
+        "recoverable_from_cache": 0,
+        "problems": [],
+    }
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if "error" in row:
+                summary["error_rows"] += 1
+                continue
+            summary["rows"] += 1
+            judged = set(row.get("judgments") or {})
+            candidates = row.get("candidates") or {}
+            expected = {chunk_id for ids in candidates.values() for chunk_id in ids}
+            summary["judgment_slots"] += len(expected)
+            missing = sorted(expected - judged)
+            surplus = sorted(judged - expected)
+            if not missing and not surplus:
+                summary["clean_rows"] += 1
+                continue
+            summary["missing_judgments"] += len(missing)
+            summary["surplus_judgments"] += len(surplus)
+            question_id = str(row.get("question_id"))
+            for chunk_id in missing:
+                owners = sorted(name for name, ids in candidates.items() if chunk_id in ids)
+                problem = f"q{question_id}: no judgment for {chunk_id} (candidate of {owners})"
+                if live_cache and verdict_key(question_id, chunk_id) in live_cache:
+                    summary["recoverable_from_cache"] += 1
+                    problem += " -- but a verdict exists in the cache (import_run can repair)"
+                summary["problems"].append(problem)
+            for chunk_id in surplus:
+                summary["problems"].append(
+                    f"q{question_id}: judgment for {chunk_id} has no candidate slot in this row"
+                )
+    return summary
+
+
+def _audit_summary_text(summary: dict[str, Any]) -> str:
+    lines = [
+        f"audit of {summary['run_dir']}:",
+        f"  rows: {summary['rows']} clean, {summary['error_rows']} error-row(s) skipped",
+        f"  judgment slots: {summary['judgment_slots']}",
+        f"  missing judgments: {summary['missing_judgments']}",
+        f"  surplus judgments: {summary['surplus_judgments']}",
+        f"  recoverable from live cache: {summary['recoverable_from_cache']}",
+    ]
+    if summary["problems"]:
+        lines.append(f"  problems ({len(summary['problems'])}):")
+        lines.extend(f"    - {problem}" for problem in summary["problems"][:40])
+        if len(summary["problems"]) > 40:
+            lines.append(f"    ... and {len(summary['problems']) - 40} more")
+    elif summary["rows"]:
+        lines.append("  ADR-0008 invariant holds: judgments == union(candidates) on every row")
+    return "\n".join(lines)
+
+
+def verify_cache(cache_path: str | Path = DEFAULT_JUDGE_CACHE) -> dict[str, Any]:
+    """Read the whole cache without skipping anything (OQ6/D5 -- `judge.py --verify`).
+
+    `load_cache` is deliberately forgiving: a torn line is skipped so a kill -9
+    cannot make the file unreadable. That forgiveness is exactly what can hide a
+    growing tear, so the verify pass reports what a load would silently drop:
+    malformed lines, duplicate keys (which line wins), stale-sha counts, and
+    records that fail `ChunkJudgment`'s shape. Only `malformed` / `duplicate_keys`
+    / `invalid` are exit-non-zero material in `main`; everything else is a report.
+    """
+    path = Path(cache_path)
+    tally: dict[str, Any] = {
+        "path": str(path),
+        "exists": path.exists(),
+        "lines": 0,
+        "valid": 0,
+        "malformed": 0,
+        "invalid": 0,
+        "duplicate_keys": 0,
+        "by_prompt_sha": {},
+        "duplicate_key_detail": [],
+        "invalid_detail": [],
+    }
+    if not path.exists():
+        return tally
+
+    seen: dict[tuple[str, str], int] = {}
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            tally["lines"] += 1
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                tally["malformed"] += 1
+                if len(tally["invalid_detail"]) < 10:
+                    tally["invalid_detail"].append(f"line {line_number}: torn/unparseable JSON")
+                continue
+            key = verdict_key(record.get("question_id", ""), record.get("chunk_id", ""))
+            sha = str(record.get("judge_prompt_sha"))
+            tally["by_prompt_sha"][sha] = tally["by_prompt_sha"].get(sha, 0) + 1
+            if key in seen:
+                tally["duplicate_keys"] += 1
+                if len(tally["duplicate_key_detail"]) < 10:
+                    tally["duplicate_key_detail"].append(
+                        f"line {line_number}: duplicate ({key[0]}, {key[1]}) -- "
+                        f"first seen on line {seen[key]}; last write wins"
+                    )
+            else:
+                seen[key] = line_number
+            shape_problems = []
+            for field_name in ("relevance", "supports_options", "reason"):
+                if field_name not in record:
+                    shape_problems.append(f"missing {field_name}")
+            if record.get("relevance") not in {"relevant", "partial", "irrelevant"}:
+                shape_problems.append(f"relevance={record.get('relevance')!r} is not a verdict level")
+            if not isinstance(record.get("supports_options"), list):
+                shape_problems.append("supports_options is not a list")
+            if shape_problems:
+                tally["invalid"] += 1
+                if len(tally["invalid_detail"]) < 10:
+                    tally["invalid_detail"].append(
+                        f"line {line_number} ({key[0]}, {key[1]}): " + "; ".join(shape_problems)
+                    )
+            else:
+                tally["valid"] += 1
+    return tally
+
+
+def compact_cache(cache_path: str | Path = DEFAULT_JUDGE_CACHE) -> dict[str, Any]:
+    """One-shot rewrite: drop malformed lines, dedupe keys keeping the LAST write.
+
+    (OQ6/D5.) The append-only per-question commit stays -- it is the resume
+    story -- so `compact_cache` runs deliberately after a build, not routinely:
+    it is the one pass allowed to rewrite the file, and it keeps the original as
+    `.bak` so the rewrite itself is revertable. Keep-last matches what
+    `load_cache` already serves (later lines overwrite earlier in its dict), so
+    compaction never changes what a load returns.
+    """
+    path = Path(cache_path)
+    if not path.exists():
+        raise SystemExit(f"{path} does not exist -- nothing to compact")
+
+    kept: dict[tuple[str, str], dict[str, Any]] = {}
+    malformed = 0
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                malformed += 1
+                continue
+            key = verdict_key(record.get("question_id", ""), record.get("chunk_id", ""))
+            kept[key] = record  # last write wins, same as load_cache
+
+    backup = path.with_suffix(path.suffix + ".bak")
+    if backup.exists():
+        backup.unlink()
+    path.rename(backup)
+    try:
+        with path.open("w", encoding="utf-8") as handle:
+            for record in kept.values():
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except BaseException:
+        backup.rename(path)  # put the original back; a failed compaction changes nothing
+        raise
+    return {
+        "path": str(path),
+        "backup": str(backup),
+        "records_written": len(kept),
+        "malformed_dropped": malformed,
+    }
 
 
 def stats(cache_path: str | Path = DEFAULT_JUDGE_CACHE) -> dict[str, Any]:
@@ -319,9 +536,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="seed the cache from a run's results.jsonl (repeatable)",
     )
     parser.add_argument("--stats", action="store_true", help="summarize the cache and exit")
+    parser.add_argument("--verify", action="store_true", help="full-strictness cache read (OQ6)")
+    parser.add_argument("--compact", action="store_true", help="dedupe+torn-drop rewrite (keeps .bak)")
+    parser.add_argument(
+        "--audit-run",
+        action="append",
+        default=[],
+        metavar="RUN_DIR",
+        help="check judgments == union(candidates) for a run dir (repeatable)",
+    )
     args = parser.parse_args(argv)
 
-    if not args.import_run and not args.stats:
+    if not args.import_run and not args.stats and not args.verify and not args.compact and not args.audit_run:
         parser.print_help()
         return 2
 
@@ -333,6 +559,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"{counts['already_cached']} already cached"
         )
 
+    exit_code = 0
+
+    for run_dir in args.audit_run:
+        summary = audit_run(run_dir, cache_path=args.cache)
+        print(_audit_summary_text(summary))
+        if summary["missing_judgments"] or summary["surplus_judgments"]:
+            exit_code = 1
+
+    if args.verify:
+        report = verify_cache(args.cache)
+        print(json.dumps({k: v for k, v in report.items() if k != "invalid_detail"}, indent=2, ensure_ascii=False, sort_keys=True))
+        for detail in report["invalid_detail"]:
+            print(f"  {detail}")
+        if report["duplicate_key_detail"]:
+            print("duplicate keys (last write wins):")
+            for detail in report["duplicate_key_detail"]:
+                print(f"  {detail}")
+        if report["malformed"] or report["duplicate_keys"] or report["invalid"]:
+            exit_code = 1
+
+    if args.compact:
+        report = compact_cache(args.cache)
+        print(
+            f"compacted {report['path']}: {report['records_written']} records, "
+            f"{report['malformed_dropped']} malformed dropped, original kept at {report['backup']}"
+        )
+
     if args.stats:
         summary = stats(args.cache)
         print(json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True))
@@ -340,7 +593,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"\ncurrent judge prompt sha: {summary['current_prompt_sha']} "
             f"-> {summary['usable_now']}/{summary['total']} verdicts reusable"
         )
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

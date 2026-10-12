@@ -40,6 +40,7 @@ from medical_rag.eval.judge import DEFAULT_JUDGE_CACHE, load_cache
 from medical_rag.eval.metrics import K_VALUES, aggregate
 from medical_rag.eval.rubric import judge_prompt_sha
 from medical_rag.eval.runlog import select_by_ids
+from medical_rag.eval.sample import load_sample_file
 from medical_rag.retrieval.lexical import DEFAULT_BM25_PATH, load_or_build_bm25_index
 from medical_rag.retrieval.strategy import BASE_STRATEGIES, RetrievalStrategy, build_retriever
 
@@ -65,6 +66,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=f"question to score; repeatable. Default: the pinned sample "
         f"({len(SAMPLE_QUESTION_IDS)} ids).",
+    )
+    parser.add_argument(
+        "--question-ids-file", default=None, metavar="FILE",
+        help="score the ids in a file -- a sample artifact (eval/sample_v2.json) or a "
+        "one-per-line list; mutually exclusive with --question-id",
     )
     parser.add_argument("--k", type=int, nargs="+", default=list(DEFAULT_K))
     parser.add_argument("--judge-cache", default=str(DEFAULT_JUDGE_CACHE))
@@ -104,7 +110,13 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config(args.config)
     strategy = RetrievalStrategy.from_config(config, args.strategy[0] if args.strategy else None)
     methods = args.strategy or list(BASE_STRATEGIES)
-    ids = args.question_ids or list(SAMPLE_QUESTION_IDS)
+    ids = args.question_ids
+    if args.question_ids_file:
+        if ids:
+            raise SystemExit("pass --question-id or --question-ids-file, not both")
+        ids = load_sample_file(args.question_ids_file)
+        print(f"sample file: {args.question_ids_file} -> {len(ids)} question id(s)")
+    ids = ids or list(SAMPLE_QUESTION_IDS)
     sha = judge_prompt_sha()
 
     verdicts, counts = load_cache(args.judge_cache, judge_sha=sha)

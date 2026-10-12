@@ -77,6 +77,7 @@ from medical_rag.eval.runlog import (
     select_by_ids,
     warn_on_degenerate_sample,
 )
+from medical_rag.eval.sample import build_sample, load_sample_file, render_sample_markdown
 from medical_rag.eval.store import append_chunks
 from medical_rag.generation.llm import LLMClient, LLMError
 from medical_rag.generation.preflight import Preflight, preflight
@@ -124,6 +125,12 @@ def parse_args() -> argparse.Namespace:
         "--question-ids", nargs="*", default=None,
         help=f"override the pinned sample (default: the {len(SAMPLE_QUESTION_IDS)} ids in "
         "SAMPLE_QUESTION_IDS)",
+    )
+    parser.add_argument(
+        "--question-ids-file", default=None, metavar="FILE",
+        help="sample ids from a file -- one per line, `#` comments allowed; the reproducible "
+        "way to run an enlarged sample (e.g. eval/sample_v2.json from eval/sample.py). "
+        "Every other --note should name the file the run was built from.",
     )
     parser.add_argument(
         "--sample-seed", type=int, default=DEFAULT_SAMPLE_SEED,
@@ -616,7 +623,15 @@ async def amain(args: argparse.Namespace) -> int:
 
     config = load_config(args.config)
     split = args.split or config.dev_split
-    ids = list(args.question_ids or SAMPLE_QUESTION_IDS)
+    ids = args.question_ids
+    if args.question_ids_file:
+        if ids:
+            raise SystemExit("pass --question-ids or --question-ids-file, not both")
+        ids = load_sample_file(args.question_ids_file)
+        print(f"sample file: {args.question_ids_file} -> {len(ids)} question id(s)")
+    if not ids:
+        ids = SAMPLE_QUESTION_IDS
+    ids = list(ids)
     pool = load_medqa(split)
     try:
         sample = select_by_ids(pool, ids)
@@ -762,7 +777,6 @@ async def amain(args: argparse.Namespace) -> int:
                         cache_path=args.judge_cache,
                         breaker=judge_breaker,
                         batch=args.judge_batch,
-                        judge_sha=judge_sha,
                         source_run=writer.stamp,
                     )
                 except LLMError as exc:

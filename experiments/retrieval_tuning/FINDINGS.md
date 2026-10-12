@@ -50,6 +50,16 @@ A fell-back reformulation returns the question unchanged, so that row's `__refor
 - **relevant** -- q1312, chunk `article-17026_4`: relevance=relevant supports_options=['B'] -- "The excerpt describes abdominal angina (chronic mesenteric ischemia) which presents with severe postprandial pain, weight loss, and lacks peritoneal signs, strongly supporting CT angiography to confirm the diagnosis."
 - **irrelevant** -- q1312, chunk `article-127545_111`: relevance=irrelevant supports_options=[] -- "The excerpt discusses child abuse and neglect, which is completely unrelated to the medical case of an older adult with abdominal pain and weight loss."
 
+## R2 addendum -- 2026-10-11 drop audit (ADR-0008, `judge.py --audit-run`)
+
+The audit checks every non-error row's `judgments` against the union of its `candidates` (recomputing the union from the row itself, not from any in-memory state).
+
+- `20260929T120215Z` (this run, 20 rows / 823 judgment slots): **fails the invariant** -- 14 rows clean, 6 rows off (q1312, q3998, q5209, q5949, q6205, q6753), 10 missing + 6 surplus judgments.
+- `20260929T191914Z` (smoke, 2 rows / 152 slots): **clean** -- judgments == union(candidates) on every row.
+- Mechanism: this run predates the per-batch cache path; the old harness fed the whole ~41-chunk union to the judge in **one** structured call and wrote back whatever ids it returned. The judge then (a) omitted ~1.2% of ids and (b) mis-transcribed ~0.7% into plausible-looking neighbors -- e.g. q3998's union has `article-18185_17` but the judgment came back as `article-18185_27`; q5209's union has `126937_223` but judgments include invented `_222`/`_224`. The surplus verdicts are attached to chunk_ids that exist in no candidate list; the missing ones leave slots that every score silently reads as "not supporting".
+- Impact on the numbers above: confined to the 6 affected rows (q1312, q3998, q5209, q5949, q6205, q6753). Missing slots can only undercount `supports_options` hits for the methods that surfaced those chunks; surplus ids change nothing (metrics iterate candidates, never judgments). 5 of the 10 missing `(question, chunk)` pairs have verdicts in the live cache already (from later inspection runs); the other 5 were never graded at all.
+- Disposition: numbers left as published (re-running the old one-shot path would change the data under an already-circulated table); the n=100 rebuild re-grades every slot fresh through the cached per-batch path, whose rows must pass this same audit before Stage E consumes them.
+
 ## Recommendation
 
 Fill in by hand after reading the table above *and* running `inspect_retrieval.py --from-run <this run> --open`: which strategy the Phase 6 rerun should use, and whether reformulation moved recall on the strategies where the rewrite actually reached the embedder. A strategy whose `__reform` list is identical to `__orig` proves nothing in either direction -- check the integrity section above before believing any Δ in the table.

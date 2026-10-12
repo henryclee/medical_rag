@@ -38,6 +38,7 @@ mapping, if you are chasing a name:
 """
 
 import asyncio
+import hashlib
 import json
 import re
 import threading
@@ -56,8 +57,10 @@ from medical_rag.eval import metrics
 from medical_rag.eval import report as render
 from medical_rag.eval import rewrite as reformulate
 from medical_rag.eval import rubric as judge_prompt
+from medical_rag.eval import sample
 from medical_rag.eval import store as chunk_store
 from medical_rag.eval import lab as serve
+from medical_rag.eval import harness
 
 
 def chunk(chunk_id: str, *, body: str | None = None, score: float = 1.0) -> RetrievedChunk:
@@ -325,7 +328,8 @@ def test_the_harness_keeps_no_private_copy_of_the_rubric():
         "a second copy of the rubric in the harness would let the wording it "
         "grades with drift from the sha it stamps"
     )
-    assert judge.JUDGE_SYSTEM_PROMPT is judge_prompt.JUDGE_SYSTEM_PROMPT
+    assert judge.DEFAULT_RUBRIC is judge_prompt.DEFAULT_RUBRIC
+    assert judge.DEFAULT_RUBRIC.system_prompt is judge_prompt.DEFAULT_SYSTEM_PROMPT
     assert judge.build_judge_prompt is judge_prompt.build_judge_prompt
     assert harness.judge_prompt_sha is judge_prompt.judge_prompt_sha
     built = judge_prompt.build_judge_prompt(question(), [chunk("c1")])
@@ -1314,6 +1318,207 @@ def test_the_loop_bridge_serves_pages_errors_and_all_over_real_http(tmp_path) ->
 
     status, error = _request(port, "GET", "/api/nonesuch")
     assert status == 404
+
+
+# --- Stage B: the containment sample (medical_rag.eval.sample) -----------------
+#
+# The n=100 run is only comparable to the n=20 run if the sample really is the
+# old 20 plus a deterministic fill. These tests target the ways that quietly
+# stops being true: a salted hash redrawing the fill per process, a seed that
+# is recorded but does nothing, a pinned list that is no longer a prefix, and a
+# --question-ids-file that reads the wrong shape without complaining.
+
+
+def test_sample_fill_is_deterministic_across_processes(tmp_path, monkeypatch):
+    # Python's hash() is salted per process; the fill must not depend on it.
+    # Running the builder twice in *this* process cannot catch that, so the
+    # ranking itself is re-derived the way a second process would: from the
+    # documented key, not from a remembered result.
+    monkeypatch.setattr(sample, "_load_pool", _fake_pool_factory(200))
+    artifact = sample.build_sample(split="train")
+    n_fill = sample.SAMPLE_V2_SIZE - len(sample.LEGACY_SAMPLE_IDS)
+    fillers = [f"x{i}" for i in range(200 - len(sample.LEGACY_SAMPLE_IDS))]
+    expected_fill = sorted(
+        fillers,
+        key=lambda qid: (
+            hashlib.blake2b(f"{sample.SAMPLE_V2_SEED}:{qid}".encode(), digest_size=8).digest(), qid
+        ),
+    )[:n_fill]
+    assert artifact["ids"][len(sample.LEGACY_SAMPLE_IDS):] == expected_fill, (
+        "the fill must be the documented hash rank over the remainder -- a reader "
+        "rebuilding it by hand from fill_rule must get exactly these ids"
+    )
+    assert artifact["ids"] == sample.build_sample(split="train")["ids"]
+
+
+def test_sample_seed_changes_the_fill_so_it_is_part_of_the_definition(tmp_path, monkeypatch):
+    # A seed that is recorded but never used would make two different-looking
+    # artifacts identical, and "--sample-seed 2 is part of its definition" false.
+    monkeypatch.setattr(sample, "_load_pool", _fake_pool_factory(300))
+    base = sample.build_sample(split="train", seed=2)
+    other = sample.build_sample(split="train", seed=3)
+    assert base["ids"][:20] == other["ids"][:20], "the pinned 20 are seed-independent"
+    assert base["ids"][20:] != other["ids"][20:], "a different seed must redraw the fill, visibly"
+    assert base["seed"] == 2 and other["seed"] == 3
+
+
+def test_sample_contains_the_pinned_twenty_as_a_prefix(monkeypatch):
+    monkeypatch.setattr(sample, "_load_pool", _fake_pool_factory(200))
+    artifact = sample.build_sample(split="train")
+    assert artifact["ids"][: len(sample.LEGACY_SAMPLE_IDS)] == sample.LEGACY_SAMPLE_IDS
+    assert artifact["pinned_ids"] == sample.LEGACY_SAMPLE_IDS
+    assert artifact["gold_letters"][artifact["ids"][0]] == "B"
+
+
+def test_sample_rejects_unknown_pinned_ids_and_oversized_pins(monkeypatch):
+    monkeypatch.setattr(sample, "_load_pool", _fake_pool_factory(50))
+    with pytest.raises(SystemExit, match="not in train split"):
+        sample.build_sample(split="train", pinned=["42", "999999"])
+    with pytest.raises(SystemExit, match="smaller than"):
+        sample.build_sample(split="train", size=10)
+    with pytest.raises(SystemExit, match="duplicate"):
+        sample.build_sample(split="train", pinned=["42", "42"])
+
+
+def test_sample_check_passes_on_a_fresh_artifact_and_catches_tampering(tmp_path, monkeypatch):
+    monkeypatch.setattr(sample, "_load_pool", _fake_pool_factory(200))
+    path = tmp_path / "sample.json"
+    artifact = sample.write_sample(path, split="train")
+    assert sample.check_sample(path), "a just-written artifact must reproduce itself"
+    assert sample.verify_sample(path).ok
+
+    # The two edits that must be caught: a swapped fill id, and a doctored gold
+    # letter. Both mean the file no longer satisfies the construction it claims.
+    mutated = dict(artifact)
+    mutated["ids"] = list(artifact["ids"])
+    mutated["ids"][50] = "q424242" if f"q424242" not in artifact["ids"] else "q424243"
+    path.write_text(json.dumps(mutated), encoding="utf-8")
+    assert not sample.check_sample(path)
+    result = sample.verify_sample(path)
+    assert not result.ok and "differ" in result.detail
+
+    mutated = dict(artifact)
+    gold = dict(artifact["gold_letters"])
+    first_fill = artifact["ids"][20]
+    gold[first_fill] = "A" if gold[first_fill] != "A" else "B"
+    mutated["gold_letters"] = gold
+    (tmp_path / "gold.json").write_text(json.dumps(mutated), encoding="utf-8")
+    assert not sample.check_sample(tmp_path / "gold.json")
+
+
+def test_read_sample_rejects_truncated_and_prefix_broken_artifacts(tmp_path, monkeypatch):
+    monkeypatch.setattr(sample, "_load_pool", _fake_pool_factory(200))
+    path = tmp_path / "sample.json"
+    artifact = sample.write_sample(path, split="train")
+
+    truncated = dict(artifact)
+    del truncated["gold_letters"]
+    bad = tmp_path / "truncated.json"
+    bad.write_text(json.dumps(truncated), encoding="utf-8")
+    with pytest.raises(SystemExit, match="gold_letters"):
+        sample.read_sample(bad)
+
+    wrong_size = dict(artifact, size=99)
+    bad = tmp_path / "wrong_size.json"
+    bad.write_text(json.dumps(wrong_size), encoding="utf-8")
+    with pytest.raises(SystemExit, match="size=99"):
+        sample.read_sample(bad)
+
+    reordered = dict(artifact, ids=list(reversed(artifact["ids"])))
+    bad = tmp_path / "reordered.json"
+    bad.write_text(json.dumps(reordered), encoding="utf-8")
+    with pytest.raises(SystemExit, match="containment broken"):
+        sample.read_sample(bad)
+
+    duplicated = dict(artifact, ids=artifact["ids"] + [artifact["ids"][0]], size=len(artifact["ids"]) + 1)
+    bad = tmp_path / "dup.json"
+    bad.write_text(json.dumps(duplicated), encoding="utf-8")
+    with pytest.raises(SystemExit, match="duplicate ids"):
+        sample.read_sample(bad)
+
+
+def test_load_sample_file_reads_both_shapes_and_rejects_garbage(tmp_path):
+    artifact_path = tmp_path / "sample.json"
+    artifact_path.write_text(json.dumps({"ids": ["42", "43", "44"], "size": 3}), encoding="utf-8")
+    assert sample.load_sample_file(artifact_path) == ["42", "43", "44"]
+
+    list_path = tmp_path / "retry.txt"
+    list_path.write_text(
+        "# a hand-written retry list\n\n42\n# comment after an id\n  45  \n\n", encoding="utf-8"
+    )
+    assert sample.load_sample_file(list_path) == ["42", "45"]
+
+    with pytest.raises(SystemExit, match="does not exist"):
+        sample.load_sample_file(tmp_path / "missing.json")
+    with pytest.raises(SystemExit, match="no 'ids'"):
+        (tmp_path / "no_ids.json").write_text(json.dumps({"size": 3}), encoding="utf-8")
+        sample.load_sample_file(tmp_path / "no_ids.json")
+    with pytest.raises(SystemExit, match="no ids found"):
+        (tmp_path / "empty.txt").write_text("# only comments\n", encoding="utf-8")
+        sample.load_sample_file(tmp_path / "empty.txt")
+
+
+def test_render_sample_markdown_names_the_sample_and_containment(monkeypatch):
+    monkeypatch.setattr(sample, "_load_pool", _fake_pool_factory(200))
+    text = sample.render_sample_markdown(sample.build_sample(split="train"))
+    assert "## Sample" in text
+    assert "100 questions = 20 pinned + 80 hash-ranked" in text
+    assert "Containment means" in text
+    assert ", ".join(sample.LEGACY_SAMPLE_IDS) in text, "the pinned 20 must be listed verbatim"
+
+
+def test_sample_module_cli_builds_and_checks(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(sample, "_load_pool", _fake_pool_factory(120))
+    path = tmp_path / "sample.json"
+    assert sample.main(["--build", "--path", str(path), "--split", "train"]) == 0
+    assert sample.main(["--check", "--path", str(path)]) == 0
+    assert "OK" in capsys.readouterr().out
+
+    mutated = json.loads(path.read_text(encoding="utf-8"))
+    mutated["ids"][21] = "q424242"
+    path.write_text(json.dumps(mutated), encoding="utf-8")
+    assert sample.main(["--check", "--path", str(path)]) == 1, "a tampered file must fail --check"
+    assert "MISMATCH" in capsys.readouterr().out
+    assert sample.main([]) == 2, "no mode flag is a usage error, not a build"
+
+
+def _question_with_id(question_id: str) -> MedQAQuestion:
+    q = question()
+    return MedQAQuestion(
+        id=question_id, question=q.question, options=q.options,
+        answer_idx=q.answer_idx, answer_text=q.answer_text, meta_info=None,
+    )
+
+
+def _fake_pool_factory(count: int):
+    """A deterministic stand-in for `load_medqa` with `count` questions.
+
+    The first 20 ids are the real pinned sample ids, so a default-pinned build
+    passes the membership check; the rest are `x0..xN` fillers, deliberately
+    unlike the pinned numeric ids, so tests that pass arbitrary pinned ids
+    exercise the "not in split" error path.
+    """
+    def factory(split: str):
+        pinned = list(sample.LEGACY_SAMPLE_IDS)
+        fillers = [f"x{i}" for i in range(max(0, count - len(pinned)))]
+        return [
+            MedQAQuestion(
+                id=qid, question=f"question {qid}", options={"A": "a", "B": "b", "C": "c", "D": "d"},
+                answer_idx="B", answer_text="b", meta_info=None,
+            )
+            for qid in (pinned + fillers)[:count]
+        ]
+    return factory
+
+
+def test_harness_question_ids_file_and_question_ids_are_mutually_exclusive():
+    # Both at once is ambiguous; the failure must be loud, not a silent union.
+    args = types.SimpleNamespace(
+        rerender=None, config="config/default.yaml", split=None,
+        question_ids=["44"], question_ids_file="ids.txt", limit=None,
+    )
+    with pytest.raises(SystemExit, match="not both"):
+        asyncio.run(harness.amain(args))
 
 
 

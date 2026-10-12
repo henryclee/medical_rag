@@ -297,7 +297,6 @@ class Backend:
                 cache_path=self.insp.args.judge_cache,
                 breaker=self.insp.breaker,
                 batch=self.insp.args.judge_batch,
-                judge_sha=self.insp.judge_sha,
                 source_run=self.insp.out_dir.name,
             )
             logger.info(
